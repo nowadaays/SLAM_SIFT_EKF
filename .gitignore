@@ -1,0 +1,19 @@
+﻿# Visual Studio
+.vs/
+*/bin/
+*/obj/
+*.user
+*.suo
+*.ipch
+*.db
+*.opendb
+
+# Compiled binaries and libraries
+x64/Debug/*.dll
+x64/Release/*.dll
+Debug/
+Release/
+*.pdb
+*.ilk
+*.exp
+*.lib
