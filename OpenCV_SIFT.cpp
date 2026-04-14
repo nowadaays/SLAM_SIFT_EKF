@@ -7,67 +7,100 @@ using namespace cv;
 using namespace std;
 
 int main() {
-    // Поддержка русского языка в консоли
+    // Русская консоль
     setlocale(LC_ALL, "Russian");
 
     cout << "Запуск программы..." << endl;
 
-    // Загрузка изображений (АБСОЛЮТНЫЙ ПУТЬ)
+    // --- Загрузка карты ---
     Mat map = imread("C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\map.jpg", IMREAD_GRAYSCALE);
-    Mat frame = imread("C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\frame.jpg", IMREAD_GRAYSCALE);
 
-    // Проверка загрузки
-    if (map.empty() || frame.empty()) {
-        cout << "Ошибка загрузки изображений!" << endl;
+    if (map.empty()) {
+        cout << "Ошибка загрузки карты!" << endl;
         return -1;
     }
 
-    cout << "Изображения успешно загружены!" << endl;
+    cout << "Карта загружена!" << endl;
 
-    // --- SIFT детектор ---
+    // --- Камера ---
+    VideoCapture cap("C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\video.mp4"); // 0 = вебка (или замени на путь к видео)
 
-    // ❌ СТАРЫЙ ВАРИАНТ (без ограничения количества точек)
-    // Ptr<SIFT> sift = SIFT::create();
-
-    // ✅ НОВЫЙ ВАРИАНТ (ограничиваем количество точек)
-    Ptr<SIFT> sift = SIFT::create(150); // 100–200 — оптимально
-
-    vector<KeyPoint> kp1, kp2;
-    Mat des1, des2;
-
-    sift->detectAndCompute(map, noArray(), kp1, des1);
-    sift->detectAndCompute(frame, noArray(), kp2, des2);
-
-    cout << "Ключевых точек (map): " << kp1.size() << endl;
-    cout << "Ключевых точек (frame): " << kp2.size() << endl;
-
-    // --- Сопоставление дескрипторов ---
-    BFMatcher matcher(NORM_L2);
-    vector<vector<DMatch>> knn_matches;
-
-    matcher.knnMatch(des1, des2, knn_matches, 2);
-
-    // Фильтр Лоу
-    vector<DMatch> good_matches;
-    for (size_t i = 0; i < knn_matches.size(); i++) {
-        if (knn_matches[i].size() < 2) continue;
-
-        if (knn_matches[i][0].distance < 0.75 * knn_matches[i][1].distance) {
-            good_matches.push_back(knn_matches[i][0]);
-        }
+    if (!cap.isOpened()) {
+        cout << "Ошибка открытия камеры!" << endl;
+        return -1;
     }
 
-    cout << "Хорошие совпадения: " << good_matches.size() << endl;
+    cout << "Камера запущена!" << endl;
 
-    // --- Отрисовка совпадений ---
-    Mat result;
-    drawMatches(map, kp1, frame, kp2, good_matches, result);
+    // --- SIFT ---
+    Ptr<SIFT> sift = SIFT::create(300); // можно менять 300–1000
 
-    // --- Показ окна ---
-    imshow("Совпадения SIFT", result);
+    // --- Ключевые точки карты (СЧИТАЕМ ОДИН РАЗ!) ---
+    vector<KeyPoint> kp_map;
+    Mat des_map;
 
-    cout << "Нажмите любую клавишу..." << endl;
-    waitKey(0);
+    sift->detectAndCompute(map, noArray(), kp_map, des_map);
+
+    cout << "Ключевых точек (map): " << kp_map.size() << endl;
+
+    // --- Matcher ---
+    BFMatcher matcher(NORM_L2);
+
+    int frame_id = 0;
+
+    while (true) {
+        Mat frame, gray;
+        cap >> frame;
+
+        if (frame.empty()) break;
+
+        frame_id++;
+
+        // --- пропуск кадров (ускорение) ---
+        if (frame_id % 5 != 0) continue;
+
+        // --- перевод в grayscale ---
+        cvtColor(frame, gray, COLOR_BGR2GRAY);
+
+        // --- SIFT для кадра ---
+        vector<KeyPoint> kp_frame;
+        Mat des_frame;
+
+        sift->detectAndCompute(gray, noArray(), kp_frame, des_frame);
+
+        if (des_frame.empty()) continue;
+
+        // --- сопоставление ---
+        vector<vector<DMatch>> knn_matches;
+        matcher.knnMatch(des_map, des_frame, knn_matches, 2);
+
+        // --- фильтр Лоу ---
+        vector<DMatch> good_matches;
+
+        for (size_t i = 0; i < knn_matches.size(); i++) {
+            if (knn_matches[i].size() < 2) continue;
+
+            if (knn_matches[i][0].distance < 0.75 * knn_matches[i][1].distance) {
+                good_matches.push_back(knn_matches[i][0]);
+            }
+        }
+
+        cout << "Кадр: " << frame_id
+            << " | точек: " << kp_frame.size()
+            << " | совпадений: " << good_matches.size() << endl;
+
+        // --- визуализация ---
+        Mat result;
+        drawMatches(map, kp_map, gray, kp_frame, good_matches, result);
+
+        imshow("SIFT навигация", result);
+
+        // выход по ESC
+        if (waitKey(1) == 27) break;
+    }
+
+    cap.release();
+    destroyAllWindows();
 
     return 0;
 }
