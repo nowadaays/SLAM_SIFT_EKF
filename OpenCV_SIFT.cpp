@@ -12,7 +12,7 @@ int main() {
 
     cout << "Запуск программы..." << endl;
 
-    // --- Загрузка карты ---
+    //Загрузка карты
     Mat map = imread("C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\map.jpg", IMREAD_GRAYSCALE);
 
     if (map.empty()) {
@@ -22,8 +22,8 @@ int main() {
 
     cout << "Карта загружена!" << endl;
 
-    // --- Камера ---
-    VideoCapture cap("C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\video.mp4"); // 0 = вебка (или замени на путь к видео)
+    //Камера
+    VideoCapture cap("C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\video.mp4");
 
     if (!cap.isOpened()) {
         cout << "Ошибка открытия камеры!" << endl;
@@ -32,10 +32,10 @@ int main() {
 
     cout << "Камера запущена!" << endl;
 
-    // --- SIFT ---
+    //SIFT
     Ptr<SIFT> sift = SIFT::create(300); // можно менять 300–1000
 
-    // --- Ключевые точки карты (СЧИТАЕМ ОДИН РАЗ!) ---
+    //Ключевые точки карты
     vector<KeyPoint> kp_map;
     Mat des_map;
 
@@ -43,7 +43,7 @@ int main() {
 
     cout << "Ключевых точек (map): " << kp_map.size() << endl;
 
-    // --- Matcher ---
+    //Matcher
     BFMatcher matcher(NORM_L2);
 
     int frame_id = 0;
@@ -56,13 +56,13 @@ int main() {
 
         frame_id++;
 
-        // --- пропуск кадров (ускорение) ---
+        //Пропуск кадров(берём не каждый кадр видео, а с определённой(заданной) периодичностью)
         if (frame_id % 5 != 0) continue;
 
-        // --- перевод в grayscale ---
+        //Перводим изображение в серую картинку
         cvtColor(frame, gray, COLOR_BGR2GRAY);
 
-        // --- SIFT для кадра ---
+        //SIFT для кадра
         vector<KeyPoint> kp_frame;
         Mat des_frame;
 
@@ -70,11 +70,11 @@ int main() {
 
         if (des_frame.empty()) continue;
 
-        // --- сопоставление ---
+        //Сравнение карты с кадрами камеры
         vector<vector<DMatch>> knn_matches;
         matcher.knnMatch(des_map, des_frame, knn_matches, 2);
 
-        // --- фильтр Лоу ---
+        //Фильтр Лоу (сглаживаем картинку)
         vector<DMatch> good_matches;
 
         for (size_t i = 0; i < knn_matches.size(); i++) {
@@ -89,7 +89,7 @@ int main() {
             << " | точек: " << kp_frame.size()
             << " | совпадений: " << good_matches.size() << endl;
 
-        // --- визуализация ---
+        //Окно приложения
         Mat result;
         drawMatches(map, kp_map, gray, kp_frame, good_matches, result);
 
