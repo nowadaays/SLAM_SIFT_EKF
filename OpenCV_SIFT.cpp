@@ -35,8 +35,8 @@ int main() {
 
     cout << "Видео запущено!" << endl;
 
-    // SIFT (увеличили количество точек(800-1000))
-    Ptr<SIFT> sift = SIFT::create(1000);
+    // SIFT (увеличили количество точек)
+    Ptr<SIFT> sift = SIFT::create(800);
 
     // Ключевые точки карты
     vector<KeyPoint> kp_map;
@@ -65,7 +65,7 @@ int main() {
         // Пропуск кадров
         if (frame_id % 5 != 0) continue;
 
-        // Серый
+        // В серый
         cvtColor(frame, gray, COLOR_BGR2GRAY);
 
         // Улучшение кадра
