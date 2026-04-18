@@ -21,11 +21,10 @@ int main() {
 
     cout << "Карта загружена!" << endl;
 
-    // Улучшение карты
     equalizeHist(map, map);
     GaussianBlur(map, map, Size(3, 3), 0);
 
-    // Видео (камера)
+    // Видео(камера)
     VideoCapture cap("C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\video.mp4");
 
     if (!cap.isOpened()) {
@@ -35,22 +34,35 @@ int main() {
 
     cout << "Видео запущено!" << endl;
 
-    // SIFT (увеличили количество точек)
-    Ptr<SIFT> sift = SIFT::create(800);
+    //SIFT(кол-во точек)
+    Ptr<SIFT> sift = SIFT::create(1000);
 
-    // Ключевые точки карты
     vector<KeyPoint> kp_map;
     Mat des_map;
-
     sift->detectAndCompute(map, noArray(), kp_map, des_map);
 
     cout << "Ключевых точек (map): " << kp_map.size() << endl;
 
     BFMatcher matcher(NORM_L2);
 
+    //Калман (x, y, vx, vy)
+    KalmanFilter kf(4, 2, 0);
+
+    kf.transitionMatrix = (Mat_<float>(4, 4) <<
+        1, 0, 1, 0,
+        0, 1, 0, 1,
+        0, 0, 1, 0,
+        0, 0, 0, 1);
+
+    setIdentity(kf.measurementMatrix);
+    setIdentity(kf.processNoiseCov, Scalar::all(1e-3));
+    setIdentity(kf.measurementNoiseCov, Scalar::all(1e-1));
+    setIdentity(kf.errorCovPost, Scalar::all(1));
+
+    Mat measurement = Mat::zeros(2, 1, CV_32F);
+
     int frame_id = 0;
 
-    // Последняя позиция
     Point2f last_position;
     bool has_position = false;
 
@@ -62,17 +74,12 @@ int main() {
 
         frame_id++;
 
-        // Пропуск кадров
         if (frame_id % 5 != 0) continue;
 
-        // В серый
         cvtColor(frame, gray, COLOR_BGR2GRAY);
-
-        // Улучшение кадра
         equalizeHist(gray, gray);
         GaussianBlur(gray, gray, Size(3, 3), 0);
 
-        // SIFT для кадра
         vector<KeyPoint> kp_frame;
         Mat des_frame;
 
@@ -80,7 +87,6 @@ int main() {
 
         if (des_frame.empty()) continue;
 
-        // Сопоставление
         vector<vector<DMatch>> knn_matches;
         matcher.knnMatch(des_map, des_frame, knn_matches, 2);
 
@@ -95,13 +101,13 @@ int main() {
         }
 
         cout << "Кадр: " << frame_id
-            << " | точек: " << kp_frame.size()
-            << " | совпадений: " << good_matches.size();
+             << " | точек: " << kp_frame.size()
+             << " | совпадений: " << good_matches.size();
 
         Point2f current_position;
         bool valid_position = false;
 
-        // Проверка через гомографию
+        // Гомография
         if (good_matches.size() >= 10) {
             vector<Point2f> pts_map, pts_frame;
 
@@ -113,7 +119,6 @@ int main() {
             Mat H = findHomography(pts_frame, pts_map, RANSAC);
 
             if (!H.empty()) {
-                // Центр кадра
                 vector<Point2f> frame_center(1, Point2f(gray.cols / 2, gray.rows / 2));
                 vector<Point2f> map_center;
 
@@ -129,21 +134,46 @@ int main() {
             }
         }
 
-        // Логика принятия решения
+        //Предсказание Калмана
+        Mat prediction = kf.predict();
+        Point2f predicted(prediction.at<float>(0), prediction.at<float>(1));
+
+        bool used_prediction = false;
+
+        //ЛОГИКА
         if (valid_position) {
+
+            //Анти-телепортация
             if (has_position) {
-                // Сглаживание
-                current_position = 0.8 * last_position + 0.2 * current_position;
+                float dist = norm(current_position - last_position);
+
+                if (dist > 100) { // порог
+                    cout << " | ОТКЛОНЕНО (скачок)";
+                    valid_position = false;
+                }
             }
+        }
+
+        if (valid_position) {
+
+            measurement.at<float>(0) = current_position.x;
+            measurement.at<float>(1) = current_position.y;
+
+            kf.correct(measurement);
 
             last_position = current_position;
             has_position = true;
+            used_prediction = false;
 
             cout << " | Позиция: (" << current_position.x << ", " << current_position.y << ")";
         }
         else if (has_position) {
-            cout << " | Используем прошлую позицию: ("
-                << last_position.x << ", " << last_position.y << ")";
+
+            last_position = predicted;
+            used_prediction = true;
+
+            cout << " | Предсказание: ("
+                 << predicted.x << ", " << predicted.y << ")";
         }
         else {
             cout << " | Позиция не определена";
@@ -155,9 +185,16 @@ int main() {
         Mat result;
         drawMatches(map, kp_map, gray, kp_frame, good_matches, result);
 
-        // Рисуем точку на карте
         if (has_position) {
-            circle(result, last_position, 10, Scalar(0, 255, 0), -1);
+
+            if (used_prediction) {
+                //Предсказание
+                circle(result, last_position, 10, Scalar(255, 0, 0), -1);
+            }
+            else {
+                //Реальная позиция
+                circle(result, last_position, 10, Scalar(0, 255, 0), -1);
+            }
         }
 
         imshow("SIFT навигация", result);
