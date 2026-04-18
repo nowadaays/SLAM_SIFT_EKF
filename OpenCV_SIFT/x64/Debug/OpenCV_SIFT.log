@@ -1,2 +1,13 @@
 ﻿  OpenCV_SIFT.cpp
+C:\Users\pshen\source\repos\OpenCV_SIFT\OpenCV_SIFT.cpp(122,82): warning C4244: аргумент: преобразование "int" в "_Tp", возможна потеря данных
+C:\Users\pshen\source\repos\OpenCV_SIFT\OpenCV_SIFT.cpp(122,82): warning C4244:         with
+C:\Users\pshen\source\repos\OpenCV_SIFT\OpenCV_SIFT.cpp(122,82): warning C4244:         [
+C:\Users\pshen\source\repos\OpenCV_SIFT\OpenCV_SIFT.cpp(122,82): warning C4244:             _Tp=float
+C:\Users\pshen\source\repos\OpenCV_SIFT\OpenCV_SIFT.cpp(122,82): warning C4244:         ]
+C:\Users\pshen\source\repos\OpenCV_SIFT\OpenCV_SIFT.cpp(122,67): warning C4244: аргумент: преобразование "int" в "_Tp", возможна потеря данных
+C:\Users\pshen\source\repos\OpenCV_SIFT\OpenCV_SIFT.cpp(122,67): warning C4244:         with
+C:\Users\pshen\source\repos\OpenCV_SIFT\OpenCV_SIFT.cpp(122,67): warning C4244:         [
+C:\Users\pshen\source\repos\OpenCV_SIFT\OpenCV_SIFT.cpp(122,67): warning C4244:             _Tp=float
+C:\Users\pshen\source\repos\OpenCV_SIFT\OpenCV_SIFT.cpp(122,67): warning C4244:         ]
+C:\Users\pshen\source\repos\OpenCV_SIFT\OpenCV_SIFT.cpp(148,28): warning C4244: инициализация: преобразование "double" в "float", возможна потеря данных
   OpenCV_SIFT.vcxproj -> C:\Users\pshen\source\repos\OpenCV_SIFT\x64\Debug\OpenCV_SIFT.exe
