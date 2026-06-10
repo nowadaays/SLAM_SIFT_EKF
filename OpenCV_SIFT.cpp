@@ -1,289 +1,393 @@
-﻿#include <opencv2/opencv.hpp>
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
 #include <iostream>
 #include <windows.h>
+#include "INS.h"
+#include <fstream>
+#include <iomanip>
 
 using namespace cv;
 using namespace std;
 
 int main() {
-    // Установка русской локали для корректного вывода сообщений в консоль
-    setlocale(LC_ALL, "Russian");
+    // NO setlocale - remove Russian encoding completely
 
-    cout << "Запуск программы..." << endl;
+    cout << "========================================" << endl;
+    cout << "  Drone Navigation System (INS + SIFT)" << endl;
+    cout << "========================================" << endl << endl;
 
-    // ===== ЗАГРУЗКА ЭТАЛОННОЙ КАРТЫ =====
-    // Загружаем изображение карты/ориентира в градациях серого
+    // ========== INS INITIALIZATION ==========
+    INSConfig config;
+    INS ins(config);
+
+    // Time parameters for INS
+    double dt = 0.033;  // approximately 30 FPS
+    double time = 0.0;
+
+    bool initial_position_set = false;
+
+    // ========== LOAD MAP ==========
+    cout << "Loading map..." << endl;
     Mat map = imread("C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\map.jpg", IMREAD_GRAYSCALE);
 
-    // Проверка: удалось ли загрузить изображение
     if (map.empty()) {
-        cout << "Ошибка загрузки карты!" << endl;
+        cout << "ERROR: Failed to load map!" << endl;
+        cout << "Check path: C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\map.jpg" << endl;
         return -1;
     }
 
-    // Выравнивание гистограммы - улучшает контрастность изображения
+    cout << "Map loaded! Size: " << map.cols << "x" << map.rows << endl;
+
+    // Map enhancement
     equalizeHist(map, map);
-    // Применение размытия по Гауссу для уменьшения шума
     GaussianBlur(map, map, Size(3, 3), 0);
 
-    // ===== ЗАГРУЗКА ВИДЕО =====
-    // Открываем видеофайл для обработки
+    // ========== LOAD VIDEO ==========
+    cout << "Loading video..." << endl;
     VideoCapture cap("C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\video.mp4");
 
-    // Проверка: удалось ли открыть видео
     if (!cap.isOpened()) {
-        cout << "Ошибка открытия видео!" << endl;
+        cout << "ERROR: Failed to open video!" << endl;
+        cout << "Check path: C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\video.mp4" << endl;
         return -1;
     }
 
-    cout << "Видео запущено!" << endl;
+    cout << "Video loaded! FPS: " << cap.get(CAP_PROP_FPS) << endl;
 
-    // ===== НАСТРОЙКА SIFT (Scale-Invariant Feature Transform) =====
-    // Создаём детектор SIFT с максимум 1000 ключевых точек на изображение
-    Ptr<SIFT> sift = SIFT::create(1000);
+    // ========== SIFT INITIALIZATION ==========
+    cout << "Initializing SIFT..." << endl;
+    Ptr<SIFT> sift = SIFT::create(2000);
 
-    // Детектируем ключевые точки и вычисляем дескрипторы для эталонной карты
-    vector<KeyPoint> kp_map;    // Ключевые точки карты
-    Mat des_map;                // Дескрипторы карты (числовые характеристики точек)
+    // Map keypoints
+    vector<KeyPoint> kp_map;
+    Mat des_map;
     sift->detectAndCompute(map, noArray(), kp_map, des_map);
 
-    cout << "Ключевых точек (map): " << kp_map.size() << endl;
+    cout << "Map keypoints: " << kp_map.size() << endl;
 
-    // Создаём BFMatcher (Brute-Force Matcher) с евклидовым расстоянием (L2)
+    // Matcher
     BFMatcher matcher(NORM_L2);
 
-    // ===== ФИЛЬТР КАЛМАНА =====
-    // 4 состояния: [x, y, vx, vy] (положение и скорость по осям)
-    // 2 измерения: [x, y] (наблюдаемые координаты)
-    KalmanFilter kf(4, 2, 0);
+    // ========== TRACKING VARIABLES ==========
+    int frame_id = 0;
+    Point2f sift_position(0, 0);
+    Point2f ins_position(0, 0);
+    Point2f fused_position(0, 0);
+    bool sift_valid = false;
+    int good_matches_count = 0;
+    const int MIN_MATCHES = 10;
 
-    float dt = 1.0f;  // Временной шаг между кадрами
+    vector<Point2f> position_history;
+    const int HISTORY_SIZE = 5;
 
-    // Матрица перехода состояния: предсказывает новое положение на основе предыдущего
-    // x_new = x + vx*dt
-    // y_new = y + vy*dt
-    // vx_new = vx
-    // vy_new = vy
-    kf.transitionMatrix = (Mat_<float>(4, 4) <<
-        1, 0, dt, 0,
-        0, 1, 0, dt,
-        0, 0, 1, 0,
-        0, 0, 0, 1);
+    // Trajectory for drawing
+    vector<Point2f> trajectory;
 
-    // Матрица измерений: из состояния [x,y,vx,vy] извлекаем только [x,y]
-    kf.measurementMatrix = (Mat_<float>(2, 4) <<
-        1, 0, 0, 0,
-        0, 1, 0, 0);
+    // Statistics
+    double total_sift_found = 0;
+    double total_frames_processed = 0;
+    double min_matches = 999999;
+    double max_matches = 0;
+    double avg_matches = 0;
 
-    // Ковариация шума процесса (доверие к модели движения)
-    setIdentity(kf.processNoiseCov, Scalar::all(1e-2));
-    // Ковариация шума измерений (доверие к наблюдениям)
-    setIdentity(kf.measurementNoiseCov, Scalar::all(1e-1));
-    // Начальная ковариация ошибки
-    setIdentity(kf.errorCovPost, Scalar::all(1));
+    // File for trajectory recording
+    ofstream traj_file("trajectory.txt");
+    traj_file << "frame\ttime\tSIFT_x\tSIFT_y\tINS_x\tINS_y\tFused_x\tFused_y\tlat\tlon\talt\tspeed\tSIFT_valid\tmatches\n";
 
-    // Начальное состояние: все нули
-    kf.statePost = (Mat_<float>(4, 1) << 0, 0, 0, 0);
+    // ========== IMU DATA (in reality get from drone) ==========
+    Vector3d A(0.0, 0.0, 9.81);
+    Vector3d W(0.0, 0.0, 0.0);
 
-    Mat measurement = Mat::zeros(2, 1, CV_32F);  // Вектор для измерений
-    bool kalman_initialized = false;             // Флаг инициализации фильтра
+    // ========== MAIN LOOP ==========
+    cout << endl << "Starting video processing..." << endl << endl;
+    cout << "Match threshold: " << MIN_MATCHES << " (SIFT ACTIVE if >= " << MIN_MATCHES << ")" << endl << endl;
 
-    int frame_id = 0;          // Счётчик кадров
-    Point2f last_position;     // Последняя достоверная позиция
-    bool has_position = false;  // Есть ли текущая позиция
-
-    // ===== ГЛАВНЫЙ ЦИКЛ ОБРАБОТКИ ВИДЕО =====
     while (true) {
-
         Mat frame, gray;
-        cap >> frame;  // Захватываем следующий кадр
+        cap >> frame;
 
-        if (frame.empty()) break;  // Если кадров больше нет - выходим
+        if (frame.empty()) {
+            cout << "End of video!" << endl;
+            break;
+        }
 
         frame_id++;
+        time += dt;
+        total_frames_processed++;
 
-        // Обрабатываем каждый 5-й кадр для повышения производительности
-        if (frame_id % 5 != 0) continue;
+        // ===== 1. INS UPDATE =====
+        ins.update(A, W, dt, time, 0.0, 0.0);
 
-        // Преобразуем кадр в оттенки серого
+        double lat, lon, alt;
+        double vn, vh, ve;
+        ins.getPosition(lat, lon, alt);
+        ins.getVelocity(vn, vh, ve);
+
+        double scale = 100000;
+        ins_position.x = lon * scale;
+        ins_position.y = lat * scale;
+
+        // ===== 2. FRAME PROCESSING (SIFT) =====
         cvtColor(frame, gray, COLOR_BGR2GRAY);
-        // Улучшаем контрастность
         equalizeHist(gray, gray);
-        // Уменьшаем шум
         GaussianBlur(gray, gray, Size(3, 3), 0);
 
-        // Детектируем ключевые точки и дескрипторы для текущего кадра
         vector<KeyPoint> kp_frame;
         Mat des_frame;
         sift->detectAndCompute(gray, noArray(), kp_frame, des_frame);
 
-        // Если дескрипторов нет - пропускаем кадр
-        if (des_frame.empty()) continue;
+        sift_valid = false;
+        good_matches_count = 0;
+        vector<DMatch> good_matches;
 
-        // ===== ПОИСК СООТВЕТСТВИЙ МЕЖДУ ЭТАЛОНОМ И КАДРОМ =====
-        vector<vector<DMatch>> knn_matches;
-        // Находим 2 ближайших соседа для каждого дескриптора эталона
-        matcher.knnMatch(des_map, des_frame, knn_matches, 2);
+        if (!des_frame.empty() && kp_map.size() > 0) {
+            vector<vector<DMatch>> knn_matches;
+            matcher.knnMatch(des_map, des_frame, knn_matches, 2);
 
-        vector<DMatch> good_matches;  // Хорошие совпадения
+            for (size_t i = 0; i < knn_matches.size(); i++) {
+                if (knn_matches[i].size() >= 2) {
+                    if (knn_matches[i][0].distance < 0.7 * knn_matches[i][1].distance) {
+                        good_matches.push_back(knn_matches[i][0]);
+                    }
+                }
+            }
 
-        // Применяем тест Лоу (Lowe's ratio test) для фильтрации ложных совпадений
-        for (size_t i = 0; i < knn_matches.size(); i++) {
-            if (knn_matches[i].size() < 2) continue;
+            good_matches_count = good_matches.size();
 
-            // Сохраняем совпадение, если лучшее значительно лучше второго (коэф. 0.75)
-            if (knn_matches[i][0].distance < 0.75 * knn_matches[i][1].distance) {
-                good_matches.push_back(knn_matches[i][0]);
+            if (good_matches_count > 0) {
+                if (good_matches_count < min_matches) min_matches = good_matches_count;
+                if (good_matches_count > max_matches) max_matches = good_matches_count;
+                avg_matches = (avg_matches * (total_sift_found)+good_matches_count) / (total_sift_found + 1);
+            }
+
+            if (good_matches_count >= MIN_MATCHES) {
+                vector<Point2f> pts_map, pts_frame;
+                for (auto& m : good_matches) {
+                    pts_map.push_back(kp_map[m.queryIdx].pt);
+                    pts_frame.push_back(kp_frame[m.trainIdx].pt);
+                }
+
+                Mat H = findHomography(pts_frame, pts_map, RANSAC, 3.0);
+                if (!H.empty()) {
+                    vector<Point2f> frame_center(1, Point2f(gray.cols / 2, gray.rows / 2));
+                    vector<Point2f> map_center;
+                    perspectiveTransform(frame_center, map_center, H);
+                    sift_position = map_center[0];
+                    sift_valid = true;
+                    total_sift_found++;
+
+                    if (!initial_position_set) {
+                        ins.resetPosition(sift_position.y / scale, sift_position.x / scale, 0.0);
+                        initial_position_set = true;
+                        cout << "\n>>> INITIAL POSITION SET: (" << sift_position.x << ", " << sift_position.y << ")" << endl;
+                        cout << "    (found " << good_matches_count << " matches, threshold " << MIN_MATCHES << ")" << endl << endl;
+                    }
+                    else {
+                        double alpha = 0.3;
+                        double target_lat = sift_position.y / scale;
+                        double target_lon = sift_position.x / scale;
+                        double current_lat = lat;
+                        double current_lon = lon;
+                        double new_lat = current_lat * (1 - alpha) + target_lat * alpha;
+                        double new_lon = current_lon * (1 - alpha) + target_lon * alpha;
+                        ins.resetPosition(new_lat, new_lon, 0.0);
+                    }
+                }
             }
         }
 
-        cout << "Кадр: " << frame_id
-            << " | совпадений: " << good_matches.size();
-
-        Point2f current_position;
-        bool valid_position = false;
-        int inliers_count = 0;
-
-        Mat mask;  // Маска для хранения inliers после RANSAC
-
-        // ===== ВЫЧИСЛЕНИЕ ГОМОГРАФИИ =====
-        // Нужно минимум 10 совпадений для надёжного расчёта
-        if (good_matches.size() >= 10) {
-
-            vector<Point2f> pts_map, pts_frame;
-
-            // Собираем координаты соответствующих точек
-            for (auto& m : good_matches) {
-                pts_map.push_back(kp_map[m.queryIdx].pt);    // Точка на эталоне
-                pts_frame.push_back(kp_frame[m.trainIdx].pt); // Точка на кадре
-            }
-
-            // Находим гомографию (матрицу преобразования) методом RANSAC
-            // Вход: точки кадра -> выход: соответствующие точки карты
-            Mat H = findHomography(pts_frame, pts_map, RANSAC, 5.0, mask);
-
-            if (!H.empty()) {
-
-                // Количество inliers - точек, согласующихся с найденной гомографией
-                inliers_count = countNonZero(mask);
-
-                // Берём центр текущего кадра
-                vector<Point2f> frame_center(1, Point2f(gray.cols / 2, gray.rows / 2));
-                vector<Point2f> map_center;
-
-                // Преобразуем центр кадра в координаты на эталонной карте
-                perspectiveTransform(frame_center, map_center, H);
-
-                current_position = map_center[0];  // Текущая позиция на карте
-
-                // Считаем позицию достоверной, если много inliers
-                if (inliers_count >= 8)
-                    valid_position = true;
-
-                cout << " | inliers: " << inliers_count;
-            }
-        }
-
-        // ===== ПРИМЕНЕНИЕ ФИЛЬТРА КАЛМАНА =====
-        // Предсказываем следующее состояние на основе текущего
-        Mat prediction = kf.predict();
-        Point2f predicted(prediction.at<float>(0), prediction.at<float>(1));
-
-        bool used_prediction = false;
-
-        // ОТБРОС ВЫБРОСОВ: если позиция слишком резко изменилась (>120 пикселей)
-        if (valid_position && has_position) {
-            if (norm(current_position - last_position) > 120) {
-                valid_position = false;  // Отклоняем как выброс
-                cout << " | ОТКЛОНЕНО";
-            }
-        }
-
-        if (valid_position) {
-            // Если это первое достоверное измерение - инициализируем фильтр
-            if (!kalman_initialized) {
-                kf.statePost.at<float>(0) = current_position.x;
-                kf.statePost.at<float>(1) = current_position.y;
-                kf.statePost.at<float>(2) = 0;  // Начальная скорость по X
-                kf.statePost.at<float>(3) = 0;  // Начальная скорость по Y
-                kalman_initialized = true;
-            }
-
-            // Передаём измерение в фильтр Калмана
-            measurement.at<float>(0) = current_position.x;
-            measurement.at<float>(1) = current_position.y;
-            kf.correct(measurement);  // Коррекция состояния
-
-            last_position = current_position;
-            has_position = true;
-
-            cout << " | POS: (" << current_position.x << ", " << current_position.y << ")";
-        }
-        else if (has_position) {
-            // Нет достоверного измерения - используем предсказание
-            last_position = predicted;
-            used_prediction = true;
-
-            cout << " | PRED: (" << predicted.x << ", " << predicted.y << ")";
+        // ===== 3. DATA FUSION =====
+        if (sift_valid) {
+            fused_position.x = 0.7 * sift_position.x + 0.3 * ins_position.x;
+            fused_position.y = 0.7 * sift_position.y + 0.3 * ins_position.y;
         }
         else {
-            cout << " | нет позиции";
+            fused_position = ins_position;
+        }
+
+        // Smoothing trajectory
+        position_history.push_back(fused_position);
+        if (position_history.size() > HISTORY_SIZE) {
+            position_history.erase(position_history.begin());
+        }
+
+        Point2f smoothed_position(0, 0);
+        for (const auto& pos : position_history) {
+            smoothed_position.x += pos.x;
+            smoothed_position.y += pos.y;
+        }
+        if (position_history.size() > 0) {
+            smoothed_position.x /= position_history.size();
+            smoothed_position.y /= position_history.size();
+        }
+
+        trajectory.push_back(smoothed_position);
+        if (trajectory.size() > 200) {
+            trajectory.erase(trajectory.begin());
+        }
+
+        // ===== 4. CONSOLE OUTPUT =====
+        double speed = sqrt(vn * vn + ve * ve);
+        string mode = sift_valid ? "FUSION" : "INS_ONLY";
+        string sift_status = sift_valid ? "YES" : "NO";
+
+        cout << "--------------------------------------------------" << endl;
+        cout << "Frame #" << frame_id << " | Time: " << fixed << setprecision(1) << time << "s" << endl;
+        cout << "--------------------------------------------------" << endl;
+        cout << "  SIFT Status:      " << sift_status << endl;
+        cout << "  Matches:          " << good_matches_count << " / " << MIN_MATCHES << endl;
+        cout << "  Position (X,Y):   (" << (int)smoothed_position.x << ", " << (int)smoothed_position.y << ") px" << endl;
+        cout << "  Mode:             " << mode << endl;
+        cout << "--------------------------------------------------" << endl;
+        cout << "  INS Latitude:     " << fixed << setprecision(6) << lat << " deg" << endl;
+        cout << "  INS Longitude:    " << lon << " deg" << endl;
+        cout << "  INS Altitude:     " << fixed << setprecision(1) << alt << " m" << endl;
+        cout << "  INS Speed:        " << (int)speed << " m/s" << endl;
+        cout << "--------------------------------------------------" << endl;
+
+        // Warnings
+        if (!sift_valid && good_matches_count > 0 && good_matches_count < MIN_MATCHES) {
+            cout << "[WARNING] Not enough matches! Need " << MIN_MATCHES
+                << ", got " << good_matches_count << endl;
+        }
+
+        if (sift_valid && initial_position_set) {
+            double error_x = abs(sift_position.x - ins_position.x);
+            double error_y = abs(sift_position.y - ins_position.y);
+            if (error_x > 50 || error_y > 50) {
+                cout << "[CORRECTION] INS deviation (" << (int)error_x << ", " << (int)error_y << ") px" << endl;
+            }
         }
 
         cout << endl;
 
-        // ===== ВИЗУАЛИЗАЦИЯ РЕЗУЛЬТАТОВ =====
+        // Write to file
+        traj_file << frame_id << "\t"
+            << time << "\t"
+            << (sift_valid ? sift_position.x : -1) << "\t"
+            << (sift_valid ? sift_position.y : -1) << "\t"
+            << ins_position.x << "\t" << ins_position.y << "\t"
+            << fused_position.x << "\t" << fused_position.y << "\t"
+            << lat << "\t" << lon << "\t" << alt << "\t"
+            << speed << "\t"
+            << sift_valid << "\t"
+            << good_matches_count << "\n";
 
-        // ВИЗУАЛИЗАЦИЯ НА КАРТЕ
-        Mat map_vis;
-        cvtColor(map, map_vis, COLOR_GRAY2BGR);  // Преобразуем в цветную для отображения
+        // ===== 5. VISUALIZATION =====
+        Mat map_color, gray_color;
+        cvtColor(map, map_color, COLOR_GRAY2BGR);
+        cvtColor(gray, gray_color, COLOR_GRAY2BGR);
 
-        if (has_position) {
-            if (used_prediction)
-                // Синий кружок - предсказанная позиция
-                circle(map_vis, last_position, 8, Scalar(255, 0, 0), -1);
-            else
-                // Зелёный кружок - измеренная позиция
-                circle(map_vis, last_position, 8, Scalar(0, 255, 0), -1);
-        }
+        int map_w = map_color.cols;
+        int frame_w = gray_color.cols;
+        int h = max(map_color.rows, gray_color.rows);
 
-        imshow("MAP", map_vis);       // Показываем карту с позицией
+        Mat result = Mat::zeros(Size(map_w + frame_w, h + 100), map_color.type());
+        map_color.copyTo(result(Rect(0, 0, map_w, map_color.rows)));
+        gray_color.copyTo(result(Rect(map_w, 0, frame_w, gray_color.rows)));
 
-        // ВИЗУАЛИЗАЦИЯ КАДРА
-        imshow("FRAME", frame);       // Показываем текущий кадр
-
-        // ВИЗУАЛИЗАЦИЯ СОВПАДЕНИЙ
-        Mat matches_img;
-
-        if (!good_matches.empty()) {
-
-            // Преобразуем маску inliers в вектор для отрисовки
-            vector<char> mask_vec;
-            if (!mask.empty()) {
-                mask_vec.assign(mask.begin<uchar>(), mask.end<uchar>());
+        // Draw SIFT matches
+        if (sift_valid && good_matches.size() > 0) {
+            for (size_t i = 0; i < min((size_t)50, good_matches.size()); i++) {
+                Point2f pt_map = kp_map[good_matches[i].queryIdx].pt;
+                Point2f pt_frame = kp_frame[good_matches[i].trainIdx].pt;
+                pt_frame.x += map_w;
+                line(result, pt_map, pt_frame, Scalar(0, 255, 0), 1);
+                circle(result, pt_map, 3, Scalar(255, 0, 0), -1);
+                circle(result, pt_frame, 3, Scalar(0, 255, 0), -1);
             }
-
-            // Рисуем линии между соответствующими точками на карте и кадре
-            drawMatches(
-                map, kp_map,
-                gray, kp_frame,
-                good_matches,
-                matches_img,
-                Scalar::all(-1),   // Цвет ключевых точек (по умолчанию)
-                Scalar::all(-1),   // Цвет совпадений (по умолчанию)
-                mask_vec,          // Маска: отрисовываем только inliers
-                DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS  // Не рисуем одиночные точки
-            );
-
-            imshow("MATCHES", matches_img);  // Показываем совпадения
         }
 
-        // Выход по клавише ESC (код 27)
-        if (waitKey(1) == 27) break;
+        // Draw trajectory
+        for (size_t i = 1; i < trajectory.size(); i++) {
+            line(result, trajectory[i - 1], trajectory[i], Scalar(255, 255, 0), 2);
+        }
+
+        // Draw positions
+        if (sift_valid) {
+            circle(result, sift_position, 12, Scalar(0, 255, 255), -1);
+            putText(result, "SIFT", Point(sift_position.x - 20, sift_position.y - 15),
+                FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 255), 2);
+        }
+
+        circle(result, ins_position, 12, Scalar(255, 0, 255), -1);
+        putText(result, "INS", Point(ins_position.x - 15, ins_position.y - 15),
+            FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 0, 255), 2);
+
+        circle(result, smoothed_position, 12, Scalar(0, 255, 255), 2);
+        circle(result, smoothed_position, 5, Scalar(0, 100, 255), -1);
+        putText(result, "FUSED", Point(smoothed_position.x - 22, smoothed_position.y - 18),
+            FONT_HERSHEY_SIMPLEX, 0.4, Scalar(0, 255, 255), 1);
+
+        // ===== 6. INFO PANEL =====
+        int y_offset = h + 20;
+        rectangle(result, Point(0, h), Point(result.cols, result.rows), Scalar(40, 40, 40), -1);
+
+        char info_text[200];
+        sprintf_s(info_text, sizeof(info_text), "Frame: %d | Time: %.1f s | SIFT: %s | Matches: %d/%d | Mode: %s",
+            frame_id, time, sift_valid ? "ACTIVE" : "LOST", good_matches_count, MIN_MATCHES, mode.c_str());
+        putText(result, info_text, Point(10, y_offset), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
+
+        sprintf_s(info_text, sizeof(info_text), "Position: (%.0f, %.0f) px",
+            smoothed_position.x, smoothed_position.y);
+        putText(result, info_text, Point(10, y_offset + 30), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
+
+        sprintf_s(info_text, sizeof(info_text), "INS: Lat=%.6f Lon=%.6f Alt=%.1f m", lat, lon, alt);
+        putText(result, info_text, Point(10, y_offset + 60), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(200, 200, 200), 1);
+
+        // Statistics
+        sprintf_s(info_text, sizeof(info_text), "Stats: Found: %.0f%% | Matches: min/avg/max = %d/%.0f/%d",
+            (total_sift_found / total_frames_processed) * 100,
+            (int)min_matches, avg_matches, (int)max_matches);
+        putText(result, info_text, Point(result.cols - 480, y_offset + 30),
+            FONT_HERSHEY_SIMPLEX, 0.4, Scalar(200, 200, 200), 1);
+
+        // Status
+        if (sift_valid) {
+            putText(result, "STATUS: FUSION MODE", Point(result.cols - 250, y_offset),
+                FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
+        }
+        else {
+            putText(result, "STATUS: INS ONLY", Point(result.cols - 250, y_offset),
+                FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 0, 255), 2);
+        }
+
+        // Legend
+        putText(result, "Yellow: SIFT | Magenta: INS | Orange: FUSED | Cyan line: Trajectory",
+            Point(10, y_offset + 90), FONT_HERSHEY_SIMPLEX, 0.4, Scalar(200, 200, 200), 1);
+
+        imshow("Drone Navigation - INS + SIFT", result);
+
+        char key = waitKey(1);
+        if (key == 27) break;
+        if (key == 's' || key == 'S') {
+            string filename = "screenshot_" + to_string(frame_id) + ".png";
+            imwrite(filename, result);
+            cout << "Screenshot saved: " << filename << endl;
+        }
     }
 
-    // Освобождаем ресурсы
+    // ========== FINAL STATISTICS ==========
+    cout << endl << endl;
+    cout << "========================================" << endl;
+    cout << "         FINAL STATISTICS" << endl;
+    cout << "========================================" << endl;
+    cout << "  Match threshold:      " << MIN_MATCHES << endl;
+    cout << "  Total frames:         " << frame_id << endl;
+    cout << "  Successful SIFT:      " << total_sift_found << " (" << fixed << setprecision(1)
+        << (total_sift_found / total_frames_processed) * 100 << "%)" << endl;
+    cout << "  Lost SIFT:            " << total_frames_processed - total_sift_found << " ("
+        << fixed << setprecision(1) << ((total_frames_processed - total_sift_found) / total_frames_processed) * 100 << "%)" << endl;
+    cout << "  Min matches:          " << (min_matches == 999999 ? 0 : (int)min_matches) << endl;
+    cout << "  Max matches:          " << (int)max_matches << endl;
+    cout << "  Avg matches:          " << (int)avg_matches << endl;
+    cout << "========================================" << endl;
+    cout << "  Trajectory file:      trajectory.txt" << endl;
+    cout << "========================================" << endl;
+
+    traj_file.close();
     cap.release();
     destroyAllWindows();
 
