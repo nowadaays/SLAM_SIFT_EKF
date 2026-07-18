@@ -1,393 +1,1237 @@
 #define _CRT_SECURE_NO_WARNINGS
+#define NOMINMAX
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
+
 #include <iostream>
-#include <windows.h>
-#include "INS.h"
 #include <fstream>
 #include <iomanip>
+#include <algorithm>
+#include <cmath>
+#include <vector>
+#include <string>
+
+#include "INS.h"
 
 using namespace cv;
 using namespace std;
 
-int main() {
-    // NO setlocale - remove Russian encoding completely
+// ============================================================
+// ПОЛНЫЕ ПУТИ К ФАЙЛАМ
+// ============================================================
+const string MAP_PATH =
+"C:\\Diplom\\OpenCV_SIFT\\x64\\Debug\\map.jpg";
 
+const string VIDEO_PATH =
+"C:\\Diplom\\OpenCV_SIFT\\x64\\Debug\\video.mp4";
+
+const string TRAJECTORY_PATH =
+"C:\\Diplom\\OpenCV_SIFT\\x64\\Debug\\trajectory.txt";
+
+// ============================================================
+// ПАРАМЕТРЫ SIFT
+// ============================================================
+constexpr int SIFT_FEATURE_COUNT = 5000;
+constexpr double SIFT_CONTRAST_THRESHOLD = 0.015;
+constexpr double SIFT_EDGE_THRESHOLD = 15.0;
+
+constexpr float LOWE_RATIO = 0.82f;
+
+constexpr int MIN_MATCHES = 5;
+constexpr int MIN_INLIERS = 4;
+constexpr double MIN_INLIER_RATIO = 0.50;
+
+// Минимальное распределение совпадений по кадру.
+constexpr double MIN_POINT_SPREAD = 0.12;
+
+// ============================================================
+// ПАРАМЕТРЫ ОБЛАСТИ БИНС
+// ============================================================
+constexpr double BINS_INITIAL_RADIUS_PX = 160.0;
+constexpr double BINS_MIN_RADIUS_PX = 100.0;
+constexpr double BINS_MAX_RADIUS_PX = 700.0;
+constexpr double BINS_RADIUS_GROWTH_PX_PER_SEC = 70.0;
+constexpr double LOW_FEATURE_EXPANSION_PX = 10.0;
+
+constexpr int MIN_MAP_KEYPOINTS = 15;
+
+// ============================================================
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ============================================================
+
+bool pointInsideImage(
+    const Point2f& point,
+    const Mat& image)
+{
+    return std::isfinite(point.x) &&
+        std::isfinite(point.y) &&
+        point.x >= 0.0f &&
+        point.x < static_cast<float>(image.cols) &&
+        point.y >= 0.0f &&
+        point.y < static_cast<float>(image.rows);
+}
+
+// Подготовка изображения с помощью CLAHE.
+Mat preprocessImage(
+    const Mat& gray,
+    const Ptr<CLAHE>& clahe)
+{
+    Mat result;
+
+    clahe->apply(gray, result);
+
+    // Слабое размытие только для уменьшения шума.
+    GaussianBlur(
+        result,
+        result,
+        Size(3, 3),
+        0.4);
+
+    return result;
+}
+
+// Маленькие кадры увеличиваются перед SIFT.
+// Координаты центра далее берутся уже в увеличенном кадре.
+Mat upscaleSmallFrame(
+    const Mat& frame,
+    double& scale)
+{
+    int minimumSide =
+        std::min(frame.cols, frame.rows);
+
+    scale = 1.0;
+
+    // Для кадров размером около 90x90 получится увеличение x4.
+    if (minimumSide < 360) {
+        scale =
+            360.0 /
+            static_cast<double>(minimumSide);
+
+        scale = std::min(scale, 4.0);
+    }
+
+    if (scale <= 1.0) {
+        return frame.clone();
+    }
+
+    Mat enlarged;
+
+    resize(
+        frame,
+        enlarged,
+        Size(),
+        scale,
+        scale,
+        INTER_CUBIC);
+
+    return enlarged;
+}
+
+// Взаимная проверка совпадений:
+//
+// точка карты должна выбрать точку кадра,
+// а эта точка кадра должна выбрать ту же точку карты.
+vector<DMatch> findMutualMatches(
+    const Mat& mapDescriptors,
+    const Mat& frameDescriptors,
+    BFMatcher& matcher)
+{
+    vector<vector<DMatch>> mapToFrame;
+    vector<vector<DMatch>> frameToMap;
+
+    matcher.knnMatch(
+        mapDescriptors,
+        frameDescriptors,
+        mapToFrame,
+        2);
+
+    matcher.knnMatch(
+        frameDescriptors,
+        mapDescriptors,
+        frameToMap,
+        2);
+
+    vector<DMatch> matches;
+
+    for (size_t mapIndex = 0;
+        mapIndex < mapToFrame.size();
+        mapIndex++) {
+
+        const vector<DMatch>& forward =
+            mapToFrame[mapIndex];
+
+        if (forward.size() < 2) {
+            continue;
+        }
+
+        if (forward[0].distance >=
+            LOWE_RATIO * forward[1].distance) {
+            continue;
+        }
+
+        const DMatch& bestForward =
+            forward[0];
+
+        int frameIndex =
+            bestForward.trainIdx;
+
+        if (frameIndex < 0 ||
+            frameIndex >=
+            static_cast<int>(
+                frameToMap.size())) {
+            continue;
+        }
+
+        const vector<DMatch>& reverse =
+            frameToMap[frameIndex];
+
+        if (reverse.size() < 2) {
+            continue;
+        }
+
+        if (reverse[0].distance >=
+            LOWE_RATIO * reverse[1].distance) {
+            continue;
+        }
+
+        // reverse[0].trainIdx — индекс точки карты.
+        if (reverse[0].trainIdx !=
+            bestForward.queryIdx) {
+            continue;
+        }
+
+        matches.push_back(bestForward);
+    }
+
+    sort(
+        matches.begin(),
+        matches.end(),
+        [](const DMatch& left,
+            const DMatch& right) {
+                return left.distance <
+                    right.distance;
+        });
+
+    return matches;
+}
+
+// Определение позиции центра кадра на карте.
+bool estimateMapPosition(
+    const vector<KeyPoint>& mapKeypoints,
+    const vector<KeyPoint>& frameKeypoints,
+    const vector<DMatch>& matches,
+    const Size& frameSize,
+    Point2f& mapPosition,
+    int& inlierCount,
+    double& inlierRatio,
+    string& failureReason)
+{
+    inlierCount = 0;
+    inlierRatio = 0.0;
+
+    if (matches.size() <
+        static_cast<size_t>(MIN_MATCHES)) {
+        failureReason =
+            "Not enough mutual matches";
+        return false;
+    }
+
+    vector<Point2f> mapPoints;
+    vector<Point2f> framePoints;
+
+    mapPoints.reserve(matches.size());
+    framePoints.reserve(matches.size());
+
+    for (const DMatch& match : matches) {
+        mapPoints.push_back(
+            mapKeypoints[
+                match.queryIdx].pt);
+
+        framePoints.push_back(
+            frameKeypoints[
+                match.trainIdx].pt);
+    }
+
+    Mat inlierMask;
+
+    // Для вертикальной камеры и плоской карты устойчивое
+    // аффинное преобразование обычно точнее гомографии
+    // при небольшом количестве точек.
+    Mat affineTransform =
+        estimateAffinePartial2D(
+            framePoints,
+            mapPoints,
+            inlierMask,
+            RANSAC,
+            3.0,
+            3000,
+            0.995,
+            10);
+
+    if (affineTransform.empty() ||
+        inlierMask.empty()) {
+        failureReason =
+            "Affine RANSAC failed";
+        return false;
+    }
+
+    inlierCount =
+        countNonZero(inlierMask);
+
+    inlierRatio =
+        static_cast<double>(inlierCount) /
+        static_cast<double>(matches.size());
+
+    if (inlierCount < MIN_INLIERS) {
+        failureReason =
+            "Not enough RANSAC inliers";
+        return false;
+    }
+
+    if (inlierRatio <
+        MIN_INLIER_RATIO) {
+        failureReason =
+            "Low RANSAC inlier ratio";
+        return false;
+    }
+
+    // Проверяем, что подтверждённые точки распределены
+    // по кадру, а не находятся в одном маленьком месте.
+    vector<Point2f> inlierFramePoints;
+
+    for (int i = 0;
+        i < static_cast<int>(
+            framePoints.size());
+        i++) {
+
+        if (inlierMask.at<uchar>(i) != 0) {
+            inlierFramePoints.push_back(
+                framePoints[i]);
+        }
+    }
+
+    if (inlierFramePoints.size() <
+        static_cast<size_t>(MIN_INLIERS)) {
+        failureReason =
+            "Invalid inlier points";
+        return false;
+    }
+
+    Rect pointBounds =
+        boundingRect(inlierFramePoints);
+
+    double spreadX =
+        static_cast<double>(
+            pointBounds.width) /
+        static_cast<double>(
+            frameSize.width);
+
+    double spreadY =
+        static_cast<double>(
+            pointBounds.height) /
+        static_cast<double>(
+            frameSize.height);
+
+    if (spreadX < MIN_POINT_SPREAD ||
+        spreadY < MIN_POINT_SPREAD) {
+        failureReason =
+            "RANSAC points are too clustered";
+        return false;
+    }
+
+    vector<Point2f> frameCenter = {
+        Point2f(
+            frameSize.width * 0.5f,
+            frameSize.height * 0.5f)
+    };
+
+    vector<Point2f> transformedCenter;
+
+    transform(
+        frameCenter,
+        transformedCenter,
+        affineTransform);
+
+    if (transformedCenter.empty()) {
+        failureReason =
+            "Center transformation failed";
+        return false;
+    }
+
+    mapPosition =
+        transformedCenter[0];
+
+    failureReason = "NONE";
+
+    return std::isfinite(mapPosition.x) &&
+        std::isfinite(mapPosition.y);
+}
+
+int main()
+{
     cout << "========================================" << endl;
-    cout << "  Drone Navigation System (INS + SIFT)" << endl;
-    cout << "========================================" << endl << endl;
+    cout << " Drone Navigation System (BINS + SIFT)" << endl;
+    cout << "========================================" << endl;
+    cout << endl;
 
-    // ========== INS INITIALIZATION ==========
+    // ========================================================
+    // ИНИЦИАЛИЗАЦИЯ БИНС
+    // ========================================================
     INSConfig config;
     INS ins(config);
 
-    // Time parameters for INS
-    double dt = 0.033;  // approximately 30 FPS
-    double time = 0.0;
+    double dt = 0.033;
+    double currentTime = 0.0;
 
-    bool initial_position_set = false;
+    Vector3d acceleration(0.0, 0.0, 9.81);
+    Vector3d angularVelocity(0.0, 0.0, 0.0);
 
-    // ========== LOAD MAP ==========
+    // ========================================================
+    // ЗАГРУЗКА КАРТЫ
+    // ========================================================
     cout << "Loading map..." << endl;
-    Mat map = imread("C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\map.jpg", IMREAD_GRAYSCALE);
 
-    if (map.empty()) {
+    Mat mapOriginal =
+        imread(
+            MAP_PATH,
+            IMREAD_GRAYSCALE);
+
+    if (mapOriginal.empty()) {
         cout << "ERROR: Failed to load map!" << endl;
-        cout << "Check path: C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\map.jpg" << endl;
+        cout << MAP_PATH << endl;
         return -1;
     }
 
-    cout << "Map loaded! Size: " << map.cols << "x" << map.rows << endl;
+    cout << "Map loaded. Size: "
+        << mapOriginal.cols << "x"
+        << mapOriginal.rows << endl;
 
-    // Map enhancement
-    equalizeHist(map, map);
-    GaussianBlur(map, map, Size(3, 3), 0);
-
-    // ========== LOAD VIDEO ==========
+    // ========================================================
+    // ЗАГРУЗКА ВИДЕО
+    // ========================================================
     cout << "Loading video..." << endl;
-    VideoCapture cap("C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\video.mp4");
+
+    VideoCapture cap(VIDEO_PATH);
 
     if (!cap.isOpened()) {
         cout << "ERROR: Failed to open video!" << endl;
-        cout << "Check path: C:\\Users\\pshen\\source\\repos\\OpenCV_SIFT\\x64\\Debug\\video.mp4" << endl;
+        cout << VIDEO_PATH << endl;
         return -1;
     }
 
-    cout << "Video loaded! FPS: " << cap.get(CAP_PROP_FPS) << endl;
+    double videoFPS =
+        cap.get(CAP_PROP_FPS);
 
-    // ========== SIFT INITIALIZATION ==========
-    cout << "Initializing SIFT..." << endl;
-    Ptr<SIFT> sift = SIFT::create(2000);
+    if (videoFPS > 0.0) {
+        dt = 1.0 / videoFPS;
+    }
 
-    // Map keypoints
-    vector<KeyPoint> kp_map;
-    Mat des_map;
-    sift->detectAndCompute(map, noArray(), kp_map, des_map);
+    cout << "Video loaded. FPS: "
+        << videoFPS << endl;
 
-    cout << "Map keypoints: " << kp_map.size() << endl;
+    // ========================================================
+    // SIFT И CLAHE
+    // ========================================================
+    Ptr<CLAHE> clahe =
+        createCLAHE(
+            2.0,
+            Size(8, 8));
 
-    // Matcher
+    Mat processedMap =
+        preprocessImage(
+            mapOriginal,
+            clahe);
+
+    Ptr<SIFT> sift =
+        SIFT::create(
+            SIFT_FEATURE_COUNT,
+            3,
+            SIFT_CONTRAST_THRESHOLD,
+            SIFT_EDGE_THRESHOLD,
+            1.6);
+
     BFMatcher matcher(NORM_L2);
 
-    // ========== TRACKING VARIABLES ==========
-    int frame_id = 0;
-    Point2f sift_position(0, 0);
-    Point2f ins_position(0, 0);
-    Point2f fused_position(0, 0);
-    bool sift_valid = false;
-    int good_matches_count = 0;
-    const int MIN_MATCHES = 10;
+    // ========================================================
+    // ГЛОБАЛЬНЫЕ ТОЧКИ КАРТЫ
+    //
+    // Используются исключительно для начальной локализации.
+    // После определения начальной позиции они больше
+    // не участвуют в поиске.
+    // ========================================================
+    vector<KeyPoint> globalMapKeypoints;
+    Mat globalMapDescriptors;
 
-    vector<Point2f> position_history;
-    const int HISTORY_SIZE = 5;
+    sift->detectAndCompute(
+        processedMap,
+        noArray(),
+        globalMapKeypoints,
+        globalMapDescriptors);
 
-    // Trajectory for drawing
+    cout << "Global map keypoints: "
+        << globalMapKeypoints.size()
+        << endl;
+
+    if (globalMapDescriptors.empty()) {
+        cout << "ERROR: Map has no SIFT descriptors."
+            << endl;
+        return -1;
+    }
+
+    // ========================================================
+    // ПЕРЕМЕННЫЕ НАВИГАЦИИ
+    // ========================================================
+    bool initialPositionFound = false;
+    bool siftValid = false;
+
+    int frameID = 0;
+    int lostFrames = 0;
+
+    Point2f siftPosition(0.0f, 0.0f);
+    Point2f binsPosition(0.0f, 0.0f);
+    Point2f fusedPosition(0.0f, 0.0f);
+
+    double binsErrorRadius =
+        BINS_INITIAL_RADIUS_PX;
+
+    int goodMatchesCount = 0;
+    int inlierCount = 0;
+    double inlierRatio = 0.0;
+
+    string failureReason =
+        "Initial localization required";
+
     vector<Point2f> trajectory;
 
-    // Statistics
-    double total_sift_found = 0;
-    double total_frames_processed = 0;
-    double min_matches = 999999;
-    double max_matches = 0;
-    double avg_matches = 0;
+    // ========================================================
+    // СТАТИСТИКА
+    // ========================================================
+    double processedFrames = 0.0;
+    double successfulFrames = 0.0;
 
-    // File for trajectory recording
-    ofstream traj_file("trajectory.txt");
-    traj_file << "frame\ttime\tSIFT_x\tSIFT_y\tINS_x\tINS_y\tFused_x\tFused_y\tlat\tlon\talt\tspeed\tSIFT_valid\tmatches\n";
+    // ========================================================
+    // ФАЙЛ ТРАЕКТОРИИ
+    // ========================================================
+    ofstream trajectoryFile(
+        TRAJECTORY_PATH);
 
-    // ========== IMU DATA (in reality get from drone) ==========
-    Vector3d A(0.0, 0.0, 9.81);
-    Vector3d W(0.0, 0.0, 0.0);
+    if (!trajectoryFile.is_open()) {
+        cout << "ERROR: Cannot create trajectory file."
+            << endl;
+        return -1;
+    }
 
-    // ========== MAIN LOOP ==========
-    cout << endl << "Starting video processing..." << endl << endl;
-    cout << "Match threshold: " << MIN_MATCHES << " (SIFT ACTIVE if >= " << MIN_MATCHES << ")" << endl << endl;
+    trajectoryFile
+        << "frame\ttime\t"
+        << "SIFT_x\tSIFT_y\t"
+        << "BINS_x\tBINS_y\t"
+        << "radius\tmatches\tinliers\t"
+        << "inlier_ratio\tvalid\tmode\n";
 
+    cout << endl;
+    cout << "Starting processing..." << endl;
+    cout << endl;
+
+    // ========================================================
+    // ГЛАВНЫЙ ЦИКЛ
+    // ========================================================
     while (true) {
-        Mat frame, gray;
+        Mat frame;
+
         cap >> frame;
 
         if (frame.empty()) {
-            cout << "End of video!" << endl;
+            cout << "End of video." << endl;
             break;
         }
 
-        frame_id++;
-        time += dt;
-        total_frames_processed++;
+        frameID++;
+        processedFrames++;
+        currentTime += dt;
 
-        // ===== 1. INS UPDATE =====
-        ins.update(A, W, dt, time, 0.0, 0.0);
+        // Обновление математической модели БИНС.
+        // Географические координаты не используются для
+        // размещения области на карте, так как геопривязки нет.
+        ins.update(
+            acceleration,
+            angularVelocity,
+            dt,
+            currentTime,
+            0.0,
+            0.0);
 
-        double lat, lon, alt;
-        double vn, vh, ve;
-        ins.getPosition(lat, lon, alt);
-        ins.getVelocity(vn, vh, ve);
+        // ====================================================
+        // ПОДГОТОВКА КАДРА
+        // ====================================================
+        Mat gray;
 
-        double scale = 100000;
-        ins_position.x = lon * scale;
-        ins_position.y = lat * scale;
+        cvtColor(
+            frame,
+            gray,
+            COLOR_BGR2GRAY);
 
-        // ===== 2. FRAME PROCESSING (SIFT) =====
-        cvtColor(frame, gray, COLOR_BGR2GRAY);
-        equalizeHist(gray, gray);
-        GaussianBlur(gray, gray, Size(3, 3), 0);
+        double frameScale = 1.0;
 
-        vector<KeyPoint> kp_frame;
-        Mat des_frame;
-        sift->detectAndCompute(gray, noArray(), kp_frame, des_frame);
+        Mat enlargedFrame =
+            upscaleSmallFrame(
+                gray,
+                frameScale);
 
-        sift_valid = false;
-        good_matches_count = 0;
-        vector<DMatch> good_matches;
+        Mat processedFrame =
+            preprocessImage(
+                enlargedFrame,
+                clahe);
 
-        if (!des_frame.empty() && kp_map.size() > 0) {
-            vector<vector<DMatch>> knn_matches;
-            matcher.knnMatch(des_map, des_frame, knn_matches, 2);
+        vector<KeyPoint> frameKeypoints;
+        Mat frameDescriptors;
 
-            for (size_t i = 0; i < knn_matches.size(); i++) {
-                if (knn_matches[i].size() >= 2) {
-                    if (knn_matches[i][0].distance < 0.7 * knn_matches[i][1].distance) {
-                        good_matches.push_back(knn_matches[i][0]);
-                    }
-                }
-            }
+        sift->detectAndCompute(
+            processedFrame,
+            noArray(),
+            frameKeypoints,
+            frameDescriptors);
 
-            good_matches_count = good_matches.size();
+        // ====================================================
+        // ВЫБОР ОБЛАСТИ ПОИСКА
+        // ====================================================
+        bool globalInitializationMode =
+            !initialPositionFound;
 
-            if (good_matches_count > 0) {
-                if (good_matches_count < min_matches) min_matches = good_matches_count;
-                if (good_matches_count > max_matches) max_matches = good_matches_count;
-                avg_matches = (avg_matches * (total_sift_found)+good_matches_count) / (total_sift_found + 1);
-            }
+        vector<KeyPoint> activeMapKeypoints;
+        Mat activeMapDescriptors;
+        Mat binsMask =
+            Mat::zeros(
+                processedMap.size(),
+                CV_8UC1);
 
-            if (good_matches_count >= MIN_MATCHES) {
-                vector<Point2f> pts_map, pts_frame;
-                for (auto& m : good_matches) {
-                    pts_map.push_back(kp_map[m.queryIdx].pt);
-                    pts_frame.push_back(kp_frame[m.trainIdx].pt);
-                }
+        double currentSearchRadius =
+            binsErrorRadius;
 
-                Mat H = findHomography(pts_frame, pts_map, RANSAC, 3.0);
-                if (!H.empty()) {
-                    vector<Point2f> frame_center(1, Point2f(gray.cols / 2, gray.rows / 2));
-                    vector<Point2f> map_center;
-                    perspectiveTransform(frame_center, map_center, H);
-                    sift_position = map_center[0];
-                    sift_valid = true;
-                    total_sift_found++;
+        if (globalInitializationMode) {
+            // Глобальный поиск разрешён только до первой
+            // надёжной локализации.
+            activeMapKeypoints =
+                globalMapKeypoints;
 
-                    if (!initial_position_set) {
-                        ins.resetPosition(sift_position.y / scale, sift_position.x / scale, 0.0);
-                        initial_position_set = true;
-                        cout << "\n>>> INITIAL POSITION SET: (" << sift_position.x << ", " << sift_position.y << ")" << endl;
-                        cout << "    (found " << good_matches_count << " matches, threshold " << MIN_MATCHES << ")" << endl << endl;
-                    }
-                    else {
-                        double alpha = 0.3;
-                        double target_lat = sift_position.y / scale;
-                        double target_lon = sift_position.x / scale;
-                        double current_lat = lat;
-                        double current_lon = lon;
-                        double new_lat = current_lat * (1 - alpha) + target_lat * alpha;
-                        double new_lon = current_lon * (1 - alpha) + target_lon * alpha;
-                        ins.resetPosition(new_lat, new_lon, 0.0);
-                    }
-                }
-            }
-        }
-
-        // ===== 3. DATA FUSION =====
-        if (sift_valid) {
-            fused_position.x = 0.7 * sift_position.x + 0.3 * ins_position.x;
-            fused_position.y = 0.7 * sift_position.y + 0.3 * ins_position.y;
+            activeMapDescriptors =
+                globalMapDescriptors;
         }
         else {
-            fused_position = ins_position;
+            // После инициализации поиск карты выполняется
+            // строго внутри области ошибки БИНС.
+            circle(
+                binsMask,
+                binsPosition,
+                cvRound(currentSearchRadius),
+                Scalar(255),
+                FILLED,
+                LINE_AA);
+
+            sift->detectAndCompute(
+                processedMap,
+                binsMask,
+                activeMapKeypoints,
+                activeMapDescriptors);
         }
 
-        // Smoothing trajectory
-        position_history.push_back(fused_position);
-        if (position_history.size() > HISTORY_SIZE) {
-            position_history.erase(position_history.begin());
+        siftValid = false;
+        goodMatchesCount = 0;
+        inlierCount = 0;
+        inlierRatio = 0.0;
+
+        failureReason = "Unknown";
+
+        vector<DMatch> goodMatches;
+
+        // ====================================================
+        // СОПОСТАВЛЕНИЕ
+        // ====================================================
+        if (frameDescriptors.empty()) {
+            failureReason =
+                "Frame descriptors are empty";
         }
-
-        Point2f smoothed_position(0, 0);
-        for (const auto& pos : position_history) {
-            smoothed_position.x += pos.x;
-            smoothed_position.y += pos.y;
+        else if (activeMapDescriptors.empty()) {
+            failureReason =
+                "Map descriptors are empty";
         }
-        if (position_history.size() > 0) {
-            smoothed_position.x /= position_history.size();
-            smoothed_position.y /= position_history.size();
-        }
+        else {
+            goodMatches =
+                findMutualMatches(
+                    activeMapDescriptors,
+                    frameDescriptors,
+                    matcher);
 
-        trajectory.push_back(smoothed_position);
-        if (trajectory.size() > 200) {
-            trajectory.erase(trajectory.begin());
-        }
+            goodMatchesCount =
+                static_cast<int>(
+                    goodMatches.size());
 
-        // ===== 4. CONSOLE OUTPUT =====
-        double speed = sqrt(vn * vn + ve * ve);
-        string mode = sift_valid ? "FUSION" : "INS_ONLY";
-        string sift_status = sift_valid ? "YES" : "NO";
+            Point2f candidatePosition;
 
-        cout << "--------------------------------------------------" << endl;
-        cout << "Frame #" << frame_id << " | Time: " << fixed << setprecision(1) << time << "s" << endl;
-        cout << "--------------------------------------------------" << endl;
-        cout << "  SIFT Status:      " << sift_status << endl;
-        cout << "  Matches:          " << good_matches_count << " / " << MIN_MATCHES << endl;
-        cout << "  Position (X,Y):   (" << (int)smoothed_position.x << ", " << (int)smoothed_position.y << ") px" << endl;
-        cout << "  Mode:             " << mode << endl;
-        cout << "--------------------------------------------------" << endl;
-        cout << "  INS Latitude:     " << fixed << setprecision(6) << lat << " deg" << endl;
-        cout << "  INS Longitude:    " << lon << " deg" << endl;
-        cout << "  INS Altitude:     " << fixed << setprecision(1) << alt << " m" << endl;
-        cout << "  INS Speed:        " << (int)speed << " m/s" << endl;
-        cout << "--------------------------------------------------" << endl;
+            bool positionEstimated =
+                estimateMapPosition(
+                    activeMapKeypoints,
+                    frameKeypoints,
+                    goodMatches,
+                    processedFrame.size(),
+                    candidatePosition,
+                    inlierCount,
+                    inlierRatio,
+                    failureReason);
 
-        // Warnings
-        if (!sift_valid && good_matches_count > 0 && good_matches_count < MIN_MATCHES) {
-            cout << "[WARNING] Not enough matches! Need " << MIN_MATCHES
-                << ", got " << good_matches_count << endl;
-        }
+            if (positionEstimated &&
+                !pointInsideImage(
+                    candidatePosition,
+                    processedMap)) {
 
-        if (sift_valid && initial_position_set) {
-            double error_x = abs(sift_position.x - ins_position.x);
-            double error_y = abs(sift_position.y - ins_position.y);
-            if (error_x > 50 || error_y > 50) {
-                cout << "[CORRECTION] INS deviation (" << (int)error_x << ", " << (int)error_y << ") px" << endl;
+                positionEstimated = false;
+
+                failureReason =
+                    "Position outside map";
             }
+
+            // После инициализации позиция также обязана
+            // находиться внутри области ошибки БИНС.
+            if (positionEstimated &&
+                initialPositionFound) {
+
+                double distanceToBINS =
+                    norm(
+                        candidatePosition -
+                        binsPosition);
+
+                if (distanceToBINS >
+                    currentSearchRadius) {
+
+                    positionEstimated = false;
+
+                    failureReason =
+                        "Position outside BINS area";
+                }
+            }
+
+            if (positionEstimated) {
+                siftPosition =
+                    candidatePosition;
+
+                binsPosition =
+                    candidatePosition;
+
+                fusedPosition =
+                    candidatePosition;
+
+                siftValid = true;
+                successfulFrames++;
+                lostFrames = 0;
+
+                binsErrorRadius =
+                    BINS_MIN_RADIUS_PX;
+
+                if (!initialPositionFound) {
+                    initialPositionFound = true;
+
+                    cout << endl;
+                    cout << "INITIAL POSITION FOUND: ("
+                        << siftPosition.x << ", "
+                        << siftPosition.y << ")"
+                        << endl;
+
+                    cout << "Matches: "
+                        << goodMatchesCount
+                        << ", inliers: "
+                        << inlierCount
+                        << endl;
+                    cout << endl;
+                }
+            }
+        }
+
+        // ====================================================
+        // РОСТ ОБЛАСТИ ПРИ ПОТЕРЕ SIFT
+        // ====================================================
+        if (!siftValid) {
+            lostFrames++;
+
+            if (initialPositionFound) {
+                binsErrorRadius +=
+                    BINS_RADIUS_GROWTH_PX_PER_SEC *
+                    dt;
+
+                if (activeMapKeypoints.size() <
+                    MIN_MAP_KEYPOINTS) {
+                    binsErrorRadius +=
+                        LOW_FEATURE_EXPANSION_PX;
+                }
+
+                binsErrorRadius =
+                    std::min(
+                        BINS_MAX_RADIUS_PX,
+                        binsErrorRadius);
+            }
+        }
+
+        // ====================================================
+        // ТРАЕКТОРИЯ
+        // ====================================================
+        if (initialPositionFound &&
+            pointInsideImage(
+                fusedPosition,
+                processedMap)) {
+
+            if (trajectory.empty() ||
+                norm(
+                    fusedPosition -
+                    trajectory.back()) > 0.5) {
+
+                trajectory.push_back(
+                    fusedPosition);
+            }
+
+            if (trajectory.size() > 300) {
+                trajectory.erase(
+                    trajectory.begin());
+            }
+        }
+
+        // ====================================================
+        // КОНСОЛЬНЫЙ ВЫВОД
+        // ====================================================
+        string mode =
+            globalInitializationMode
+            ? "INITIAL_GLOBAL_SEARCH"
+            : "BINS_AREA_ONLY";
+
+        cout << "----------------------------------------"
+            << endl;
+
+        cout << "Frame:             "
+            << frameID << endl;
+
+        cout << "Mode:              "
+            << mode << endl;
+
+        cout << "SIFT:              "
+            << (siftValid
+                ? "ACTIVE"
+                : "LOST")
+            << endl;
+
+        cout << "Reason:            "
+            << failureReason << endl;
+
+        cout << "Frame size:        "
+            << gray.cols << "x"
+            << gray.rows << endl;
+
+        cout << "SIFT frame size:   "
+            << processedFrame.cols << "x"
+            << processedFrame.rows << endl;
+
+        cout << "Frame keypoints:   "
+            << frameKeypoints.size() << endl;
+
+        cout << "Map keypoints:     "
+            << activeMapKeypoints.size() << endl;
+
+        cout << "Mutual matches:    "
+            << goodMatchesCount << endl;
+
+        cout << "RANSAC inliers:    "
+            << inlierCount << endl;
+
+        cout << "Inlier ratio:      "
+            << fixed << setprecision(2)
+            << inlierRatio << endl;
+
+        cout << "BINS radius:       "
+            << binsErrorRadius << " px"
+            << endl;
+
+        if (initialPositionFound) {
+            cout << "Position:          ("
+                << cvRound(fusedPosition.x)
+                << ", "
+                << cvRound(fusedPosition.y)
+                << ")"
+                << endl;
         }
 
         cout << endl;
 
-        // Write to file
-        traj_file << frame_id << "\t"
-            << time << "\t"
-            << (sift_valid ? sift_position.x : -1) << "\t"
-            << (sift_valid ? sift_position.y : -1) << "\t"
-            << ins_position.x << "\t" << ins_position.y << "\t"
-            << fused_position.x << "\t" << fused_position.y << "\t"
-            << lat << "\t" << lon << "\t" << alt << "\t"
-            << speed << "\t"
-            << sift_valid << "\t"
-            << good_matches_count << "\n";
+        // ====================================================
+        // ЗАПИСЬ ТРАЕКТОРИИ
+        // ====================================================
+        trajectoryFile
+            << frameID << "\t"
+            << currentTime << "\t"
+            << (siftValid
+                ? siftPosition.x
+                : -1.0f) << "\t"
+            << (siftValid
+                ? siftPosition.y
+                : -1.0f) << "\t"
+            << (initialPositionFound
+                ? binsPosition.x
+                : -1.0f) << "\t"
+            << (initialPositionFound
+                ? binsPosition.y
+                : -1.0f) << "\t"
+            << binsErrorRadius << "\t"
+            << goodMatchesCount << "\t"
+            << inlierCount << "\t"
+            << inlierRatio << "\t"
+            << siftValid << "\t"
+            << mode << "\n";
 
-        // ===== 5. VISUALIZATION =====
-        Mat map_color, gray_color;
-        cvtColor(map, map_color, COLOR_GRAY2BGR);
-        cvtColor(gray, gray_color, COLOR_GRAY2BGR);
+        // ====================================================
+        // ВИЗУАЛИЗАЦИЯ
+        // ====================================================
+        Mat mapColor;
+        Mat frameColor;
 
-        int map_w = map_color.cols;
-        int frame_w = gray_color.cols;
-        int h = max(map_color.rows, gray_color.rows);
+        cvtColor(
+            processedMap,
+            mapColor,
+            COLOR_GRAY2BGR);
 
-        Mat result = Mat::zeros(Size(map_w + frame_w, h + 100), map_color.type());
-        map_color.copyTo(result(Rect(0, 0, map_w, map_color.rows)));
-        gray_color.copyTo(result(Rect(map_w, 0, frame_w, gray_color.rows)));
+        cvtColor(
+            processedFrame,
+            frameColor,
+            COLOR_GRAY2BGR);
 
-        // Draw SIFT matches
-        if (sift_valid && good_matches.size() > 0) {
-            for (size_t i = 0; i < min((size_t)50, good_matches.size()); i++) {
-                Point2f pt_map = kp_map[good_matches[i].queryIdx].pt;
-                Point2f pt_frame = kp_frame[good_matches[i].trainIdx].pt;
-                pt_frame.x += map_w;
-                line(result, pt_map, pt_frame, Scalar(0, 255, 0), 1);
-                circle(result, pt_map, 3, Scalar(255, 0, 0), -1);
-                circle(result, pt_frame, 3, Scalar(0, 255, 0), -1);
-            }
+        // Область ошибки показывается только после
+        // начальной глобальной локализации.
+        if (initialPositionFound) {
+            Mat overlay =
+                mapColor.clone();
+
+            circle(
+                overlay,
+                binsPosition,
+                cvRound(currentSearchRadius),
+                Scalar(0, 0, 255),
+                FILLED,
+                LINE_AA);
+
+            addWeighted(
+                overlay,
+                0.22,
+                mapColor,
+                0.78,
+                0.0,
+                mapColor);
+
+            circle(
+                mapColor,
+                binsPosition,
+                cvRound(currentSearchRadius),
+                Scalar(0, 0, 255),
+                2,
+                LINE_AA);
         }
 
-        // Draw trajectory
-        for (size_t i = 1; i < trajectory.size(); i++) {
-            line(result, trajectory[i - 1], trajectory[i], Scalar(255, 255, 0), 2);
+        int mapWidth =
+            mapColor.cols;
+
+        int frameWidth =
+            frameColor.cols;
+
+        int contentHeight =
+            std::max(
+                mapColor.rows,
+                frameColor.rows);
+
+        constexpr int PANEL_HEIGHT = 140;
+
+        Mat result = Mat::zeros(
+            Size(
+                mapWidth + frameWidth,
+                contentHeight +
+                PANEL_HEIGHT),
+            CV_8UC3);
+
+        mapColor.copyTo(
+            result(
+                Rect(
+                    0,
+                    0,
+                    mapColor.cols,
+                    mapColor.rows)));
+
+        frameColor.copyTo(
+            result(
+                Rect(
+                    mapWidth,
+                    0,
+                    frameColor.cols,
+                    frameColor.rows)));
+
+        // Линии совпадений.
+        size_t matchesToDraw =
+            std::min(
+                static_cast<size_t>(40),
+                goodMatches.size());
+
+        for (size_t i = 0;
+            i < matchesToDraw;
+            i++) {
+
+            const DMatch& match =
+                goodMatches[i];
+
+            Point2f mapPoint =
+                activeMapKeypoints[
+                    match.queryIdx].pt;
+
+            Point2f framePoint =
+                frameKeypoints[
+                    match.trainIdx].pt;
+
+            framePoint.x +=
+                static_cast<float>(
+                    mapWidth);
+
+            Scalar color =
+                siftValid
+                ? Scalar(0, 255, 0)
+                : Scalar(0, 100, 255);
+
+            line(
+                result,
+                mapPoint,
+                framePoint,
+                color,
+                1,
+                LINE_AA);
+
+            circle(
+                result,
+                mapPoint,
+                3,
+                color,
+                FILLED,
+                LINE_AA);
         }
 
-        // Draw positions
-        if (sift_valid) {
-            circle(result, sift_position, 12, Scalar(0, 255, 255), -1);
-            putText(result, "SIFT", Point(sift_position.x - 20, sift_position.y - 15),
-                FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 255), 2);
+        // Траектория.
+        for (size_t i = 1;
+            i < trajectory.size();
+            i++) {
+            line(
+                result,
+                trajectory[i - 1],
+                trajectory[i],
+                Scalar(255, 255, 0),
+                2,
+                LINE_AA);
         }
 
-        circle(result, ins_position, 12, Scalar(255, 0, 255), -1);
-        putText(result, "INS", Point(ins_position.x - 15, ins_position.y - 15),
-            FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 0, 255), 2);
+        if (initialPositionFound) {
+            circle(
+                result,
+                binsPosition,
+                12,
+                Scalar(255, 0, 255),
+                2,
+                LINE_AA);
 
-        circle(result, smoothed_position, 12, Scalar(0, 255, 255), 2);
-        circle(result, smoothed_position, 5, Scalar(0, 100, 255), -1);
-        putText(result, "FUSED", Point(smoothed_position.x - 22, smoothed_position.y - 18),
-            FONT_HERSHEY_SIMPLEX, 0.4, Scalar(0, 255, 255), 1);
-
-        // ===== 6. INFO PANEL =====
-        int y_offset = h + 20;
-        rectangle(result, Point(0, h), Point(result.cols, result.rows), Scalar(40, 40, 40), -1);
-
-        char info_text[200];
-        sprintf_s(info_text, sizeof(info_text), "Frame: %d | Time: %.1f s | SIFT: %s | Matches: %d/%d | Mode: %s",
-            frame_id, time, sift_valid ? "ACTIVE" : "LOST", good_matches_count, MIN_MATCHES, mode.c_str());
-        putText(result, info_text, Point(10, y_offset), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
-
-        sprintf_s(info_text, sizeof(info_text), "Position: (%.0f, %.0f) px",
-            smoothed_position.x, smoothed_position.y);
-        putText(result, info_text, Point(10, y_offset + 30), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
-
-        sprintf_s(info_text, sizeof(info_text), "INS: Lat=%.6f Lon=%.6f Alt=%.1f m", lat, lon, alt);
-        putText(result, info_text, Point(10, y_offset + 60), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(200, 200, 200), 1);
-
-        // Statistics
-        sprintf_s(info_text, sizeof(info_text), "Stats: Found: %.0f%% | Matches: min/avg/max = %d/%.0f/%d",
-            (total_sift_found / total_frames_processed) * 100,
-            (int)min_matches, avg_matches, (int)max_matches);
-        putText(result, info_text, Point(result.cols - 480, y_offset + 30),
-            FONT_HERSHEY_SIMPLEX, 0.4, Scalar(200, 200, 200), 1);
-
-        // Status
-        if (sift_valid) {
-            putText(result, "STATUS: FUSION MODE", Point(result.cols - 250, y_offset),
-                FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
-        }
-        else {
-            putText(result, "STATUS: INS ONLY", Point(result.cols - 250, y_offset),
-                FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 0, 255), 2);
+            putText(
+                result,
+                "BINS",
+                Point(
+                    cvRound(
+                        binsPosition.x - 18),
+                    cvRound(
+                        binsPosition.y - 16)),
+                FONT_HERSHEY_SIMPLEX,
+                0.5,
+                Scalar(255, 0, 255),
+                2,
+                LINE_AA);
         }
 
-        // Legend
-        putText(result, "Yellow: SIFT | Magenta: INS | Orange: FUSED | Cyan line: Trajectory",
-            Point(10, y_offset + 90), FONT_HERSHEY_SIMPLEX, 0.4, Scalar(200, 200, 200), 1);
+        if (siftValid) {
+            circle(
+                result,
+                siftPosition,
+                6,
+                Scalar(0, 255, 255),
+                FILLED,
+                LINE_AA);
 
-        imshow("Drone Navigation - INS + SIFT", result);
+            putText(
+                result,
+                "SIFT",
+                Point(
+                    cvRound(
+                        siftPosition.x + 8),
+                    cvRound(
+                        siftPosition.y + 5)),
+                FONT_HERSHEY_SIMPLEX,
+                0.45,
+                Scalar(0, 255, 255),
+                1,
+                LINE_AA);
+        }
 
-        char key = waitKey(1);
-        if (key == 27) break;
-        if (key == 's' || key == 'S') {
-            string filename = "screenshot_" + to_string(frame_id) + ".png";
-            imwrite(filename, result);
-            cout << "Screenshot saved: " << filename << endl;
+        // Информационная панель.
+        rectangle(
+            result,
+            Point(0, contentHeight),
+            Point(result.cols, result.rows),
+            Scalar(35, 35, 35),
+            FILLED);
+
+        int textY =
+            contentHeight + 25;
+
+        char text[500];
+
+        sprintf_s(
+            text,
+            sizeof(text),
+            "Frame: %d | Mode: %s | SIFT: %s",
+            frameID,
+            mode.c_str(),
+            siftValid
+            ? "ACTIVE"
+            : "LOST");
+
+        putText(
+            result,
+            text,
+            Point(10, textY),
+            FONT_HERSHEY_SIMPLEX,
+            0.52,
+            siftValid
+            ? Scalar(0, 255, 0)
+            : Scalar(0, 100, 255),
+            2,
+            LINE_AA);
+
+        sprintf_s(
+            text,
+            sizeof(text),
+            "Reason: %s",
+            failureReason.c_str());
+
+        putText(
+            result,
+            text,
+            Point(10, textY + 28),
+            FONT_HERSHEY_SIMPLEX,
+            0.47,
+            Scalar(255, 255, 255),
+            1,
+            LINE_AA);
+
+        sprintf_s(
+            text,
+            sizeof(text),
+            "Frame points: %zu | Map points: %zu | Matches: %d | Inliers: %d (%.2f)",
+            frameKeypoints.size(),
+            activeMapKeypoints.size(),
+            goodMatchesCount,
+            inlierCount,
+            inlierRatio);
+
+        putText(
+            result,
+            text,
+            Point(10, textY + 56),
+            FONT_HERSHEY_SIMPLEX,
+            0.45,
+            Scalar(200, 200, 200),
+            1,
+            LINE_AA);
+
+        sprintf_s(
+            text,
+            sizeof(text),
+            "BINS radius: %.1f px | Lost frames: %d | Frame scale: %.2f",
+            binsErrorRadius,
+            lostFrames,
+            frameScale);
+
+        putText(
+            result,
+            text,
+            Point(10, textY + 84),
+            FONT_HERSHEY_SIMPLEX,
+            0.45,
+            Scalar(200, 200, 255),
+            1,
+            LINE_AA);
+
+        if (initialPositionFound) {
+            sprintf_s(
+                text,
+                sizeof(text),
+                "Position: (%.1f, %.1f) px",
+                fusedPosition.x,
+                fusedPosition.y);
+
+            putText(
+                result,
+                text,
+                Point(10, textY + 112),
+                FONT_HERSHEY_SIMPLEX,
+                0.47,
+                Scalar(0, 255, 255),
+                1,
+                LINE_AA);
+        }
+
+        imshow(
+            "Drone Navigation - Reliable BINS + SIFT",
+            result);
+
+        int key = waitKey(1);
+
+        if (key == 27) {
+            break;
+        }
+
+        if (key == 's' ||
+            key == 'S') {
+
+            string screenshotPath =
+                "C:\\Diplom\\OpenCV_SIFT\\x64\\Debug\\screenshot_" +
+                to_string(frameID) +
+                ".png";
+
+            imwrite(
+                screenshotPath,
+                result);
         }
     }
 
-    // ========== FINAL STATISTICS ==========
-    cout << endl << endl;
+    double successPercent =
+        processedFrames > 0.0
+        ? successfulFrames /
+        processedFrames *
+        100.0
+        : 0.0;
+
+    cout << endl;
     cout << "========================================" << endl;
-    cout << "         FINAL STATISTICS" << endl;
-    cout << "========================================" << endl;
-    cout << "  Match threshold:      " << MIN_MATCHES << endl;
-    cout << "  Total frames:         " << frame_id << endl;
-    cout << "  Successful SIFT:      " << total_sift_found << " (" << fixed << setprecision(1)
-        << (total_sift_found / total_frames_processed) * 100 << "%)" << endl;
-    cout << "  Lost SIFT:            " << total_frames_processed - total_sift_found << " ("
-        << fixed << setprecision(1) << ((total_frames_processed - total_sift_found) / total_frames_processed) * 100 << "%)" << endl;
-    cout << "  Min matches:          " << (min_matches == 999999 ? 0 : (int)min_matches) << endl;
-    cout << "  Max matches:          " << (int)max_matches << endl;
-    cout << "  Avg matches:          " << (int)avg_matches << endl;
-    cout << "========================================" << endl;
-    cout << "  Trajectory file:      trajectory.txt" << endl;
+    cout << "FINAL STATISTICS" << endl;
     cout << "========================================" << endl;
 
-    traj_file.close();
+    cout << "Total frames:    "
+        << processedFrames << endl;
+
+    cout << "Successful SIFT: "
+        << successfulFrames << endl;
+
+    cout << "Success:         "
+        << fixed << setprecision(1)
+        << successPercent << "%"
+        << endl;
+
+    cout << "========================================" << endl;
+
+    trajectoryFile.close();
     cap.release();
     destroyAllWindows();
 

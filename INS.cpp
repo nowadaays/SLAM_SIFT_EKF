@@ -55,7 +55,7 @@ void INS::Navigation(const Vector3d& A_dlu, const Matrix3d& Cbn,
 
     Vector3d WEI_n(cfg.Ue * cos(FI), cfg.Ue * sin(FI), 0.0);
 
-    // Разворачиваем tuple правильно
+    // 
     Vector3d Gg;
     double R1, R2;
     std::tie(Gg, R1, R2) = EarthModel(H, FI, LAMD);
