@@ -14,6 +14,10 @@
 
 #include "INS.h"
 
+// ДОБАВЛЕНО:
+// Отдельный класс расчёта траектории.
+#include "TrajectoryCalculator.h"
+
 using namespace cv;
 using namespace std;
 
@@ -55,6 +59,83 @@ constexpr double BINS_RADIUS_GROWTH_PX_PER_SEC = 70.0;
 constexpr double LOW_FEATURE_EXPANSION_PX = 10.0;
 
 constexpr int MIN_MAP_KEYPOINTS = 15;
+
+// ============================================================
+// ДОБАВЛЕНО:
+// ВХОДНЫЕ ДАННЫЕ БУДУЩЕЙ СИМУЛЯЦИИ
+// ============================================================
+
+struct FlightSimulationData {
+    // false — симуляция пока отсутствует.
+    // В таком состоянии данные не влияют на траекторию.
+    bool available = false;
+
+    Vector3d acceleration;
+    Vector3d angularVelocity;
+
+    double altitude = 0.0;
+    double verticalVelocity = 0.0;
+};
+
+// ============================================================
+// ДОБАВЛЕНО:
+// ЗАГЛУШКА БУДУЩЕГО СИМУЛЯТОРА
+//
+// Сейчас функция возвращает available=false.
+//
+// Когда появится симулятор полёта, необходимо будет изменить
+// только содержимое этой функции и передать:
+//
+// acceleration      — показания акселерометра;
+// angularVelocity   — показания гироскопа;
+// altitude          — высоту;
+// verticalVelocity  — вертикальную скорость.
+//
+// Весь остальной расчёт траектории менять не потребуется.
+// ============================================================
+FlightSimulationData getFlightSimulationData(
+    double time,
+    double dt)
+{
+    (void)time;
+    (void)dt;
+
+    FlightSimulationData data;
+
+    data.available = false;
+
+    // Заглушки не используются, пока available == false.
+    data.acceleration =
+        Vector3d(0.0, 0.0, 9.81);
+
+    data.angularVelocity =
+        Vector3d(0.0, 0.0, 0.0);
+
+    data.altitude = 0.0;
+    data.verticalVelocity = 0.0;
+
+    /*
+    // ПРИМЕР БУДУЩЕГО ПОДКЛЮЧЕНИЯ:
+
+    simulator.update(dt);
+
+    data.available = true;
+
+    data.acceleration =
+        simulator.getAcceleration();
+
+    data.angularVelocity =
+        simulator.getAngularVelocity();
+
+    data.altitude =
+        simulator.getAltitude();
+
+    data.verticalVelocity =
+        simulator.getVerticalVelocity();
+    */
+
+    return data;
+}
 
 // ============================================================
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -381,9 +462,28 @@ int main()
     INSConfig config;
     INS ins(config);
 
+    // ========================================================
+    // ДОБАВЛЕНО:
+    // ИНИЦИАЛИЗАЦИЯ КАЛЬКУЛЯТОРА ТРАЕКТОРИИ
+    // ========================================================
+    TrajectoryConfig trajectoryConfig;
+
+    // Временная заглушка масштаба.
+    // После появления симуляции необходимо указать
+    // реальное количество пикселей на один метр.
+    trajectoryConfig.pixelsPerMeter = 3.0;
+
+    trajectoryConfig.siftCorrectionGain = 0.75;
+    trajectoryConfig.minimumPointDistance = 0.5;
+    trajectoryConfig.maximumHistorySize = 300;
+
+    TrajectoryCalculator trajectoryCalculator(
+        trajectoryConfig);
+
     double dt = 0.033;
     double currentTime = 0.0;
 
+    // Старые заглушки оставлены без изменений.
     Vector3d acceleration(0.0, 0.0, 9.81);
     Vector3d angularVelocity(0.0, 0.0, 0.0);
 
@@ -502,6 +602,8 @@ int main()
     string failureReason =
         "Initial localization required";
 
+    // Переменная сохранена, чтобы не менять
+    // существующую визуализацию.
     vector<Point2f> trajectory;
 
     // ========================================================
@@ -522,12 +624,18 @@ int main()
         return -1;
     }
 
+    // ДОБАВЛЕНО:
+    // Новые поля итоговой траектории, скорости и коррекции.
     trajectoryFile
         << "frame\ttime\t"
         << "SIFT_x\tSIFT_y\t"
         << "BINS_x\tBINS_y\t"
         << "radius\tmatches\tinliers\t"
-        << "inlier_ratio\tvalid\tmode\n";
+        << "inlier_ratio\tvalid\tmode\t"
+        << "Fused_x\tFused_y\t"
+        << "motion_available\t"
+        << "velocity_n\tvelocity_e\tvelocity_u\t"
+        << "distance_px\tcorrection_px\n";
 
     cout << endl;
     cout << "Starting processing..." << endl;
@@ -550,16 +658,94 @@ int main()
         processedFrames++;
         currentTime += dt;
 
+        // ====================================================
+        // ДОБАВЛЕНО:
+        // ПОЛУЧЕНИЕ ДАННЫХ БУДУЩЕЙ СИМУЛЯЦИИ
+        // ====================================================
+        FlightSimulationData simulationData =
+            getFlightSimulationData(
+                currentTime,
+                dt);
+
+        // Пока симуляции нет, INS получает те же данные,
+        // которые использовались в рабочей версии программы.
+        Vector3d currentAcceleration =
+            simulationData.available
+            ? simulationData.acceleration
+            : acceleration;
+
+        Vector3d currentAngularVelocity =
+            simulationData.available
+            ? simulationData.angularVelocity
+            : angularVelocity;
+
+        double currentAltitude =
+            simulationData.available
+            ? simulationData.altitude
+            : 0.0;
+
+        double currentVerticalVelocity =
+            simulationData.available
+            ? simulationData.verticalVelocity
+            : 0.0;
+
         // Обновление математической модели БИНС.
-        // Географические координаты не используются для
-        // размещения области на карте, так как геопривязки нет.
+        // При отсутствии симуляции сохранено старое поведение.
         ins.update(
-            acceleration,
-            angularVelocity,
+            currentAcceleration,
+            currentAngularVelocity,
             dt,
             currentTime,
-            0.0,
-            0.0);
+            currentAltitude,
+            currentVerticalVelocity);
+
+        // ====================================================
+        // ДОБАВЛЕНО:
+        // ПОЛУЧЕНИЕ СКОРОСТИ БИНС
+        // ====================================================
+        double binsVelocityNorth = 0.0;
+        double binsVelocityUp = 0.0;
+        double binsVelocityEast = 0.0;
+
+        ins.getVelocity(
+            binsVelocityNorth,
+            binsVelocityUp,
+            binsVelocityEast);
+
+        // ====================================================
+        // ДОБАВЛЕНО:
+        // ПРОГНОЗ ТРАЕКТОРИИ ПО БИНС
+        // ====================================================
+        TrajectoryMotionData motionData;
+
+        // Пока симуляции нет, available=false,
+        // поэтому предсказание не изменяет позицию.
+        motionData.available =
+            simulationData.available;
+
+        motionData.velocityNorth =
+            binsVelocityNorth;
+
+        motionData.velocityUp =
+            binsVelocityUp;
+
+        motionData.velocityEast =
+            binsVelocityEast;
+
+        motionData.dt = dt;
+
+        trajectoryCalculator.predict(
+            motionData);
+
+        // После появления симуляции binsPosition будет
+        // перемещаться по скорости БИНС.
+        if (trajectoryCalculator.isInitialized()) {
+            binsPosition =
+                trajectoryCalculator.getBinsPosition();
+
+            fusedPosition =
+                trajectoryCalculator.getFusedPosition();
+        }
 
         // ====================================================
         // ПОДГОТОВКА КАДРА
@@ -600,6 +786,7 @@ int main()
 
         vector<KeyPoint> activeMapKeypoints;
         Mat activeMapDescriptors;
+
         Mat binsMask =
             Mat::zeros(
                 processedMap.size(),
@@ -714,11 +901,22 @@ int main()
                 siftPosition =
                     candidatePosition;
 
+                // ============================================
+                // ДОБАВЛЕНО:
+                // КОРРЕКЦИЯ ТРАЕКТОРИИ ПО SIFT
+                //
+                // Без симуляции результат полностью совпадает
+                // с candidatePosition, как в рабочей версии.
+                // ============================================
+                trajectoryCalculator.correct(
+                    true,
+                    siftPosition);
+
                 binsPosition =
-                    candidatePosition;
+                    trajectoryCalculator.getBinsPosition();
 
                 fusedPosition =
-                    candidatePosition;
+                    trajectoryCalculator.getFusedPosition();
 
                 siftValid = true;
                 successfulFrames++;
@@ -731,6 +929,7 @@ int main()
                     initialPositionFound = true;
 
                     cout << endl;
+
                     cout << "INITIAL POSITION FOUND: ("
                         << siftPosition.x << ", "
                         << siftPosition.y << ")"
@@ -741,8 +940,27 @@ int main()
                         << ", inliers: "
                         << inlierCount
                         << endl;
+
                     cout << endl;
                 }
+            }
+        }
+
+        // ====================================================
+        // ДОБАВЛЕНО:
+        // ОБРАБОТКА SIFT LOST В КАЛЬКУЛЯТОРЕ ТРАЕКТОРИИ
+        // ====================================================
+        if (!siftValid) {
+            trajectoryCalculator.correct(
+                false,
+                Point2f(0.0f, 0.0f));
+
+            if (trajectoryCalculator.isInitialized()) {
+                binsPosition =
+                    trajectoryCalculator.getBinsPosition();
+
+                fusedPosition =
+                    trajectoryCalculator.getFusedPosition();
             }
         }
 
@@ -773,25 +991,14 @@ int main()
         // ====================================================
         // ТРАЕКТОРИЯ
         // ====================================================
-        if (initialPositionFound &&
-            pointInsideImage(
-                fusedPosition,
-                processedMap)) {
-
-            if (trajectory.empty() ||
-                norm(
-                    fusedPosition -
-                    trajectory.back()) > 0.5) {
-
-                trajectory.push_back(
-                    fusedPosition);
-            }
-
-            if (trajectory.size() > 300) {
-                trajectory.erase(
-                    trajectory.begin());
-            }
-        }
+        // ДОБАВЛЕНО:
+        // Получаем уже рассчитанную объединённую траекторию
+        // из отдельного класса.
+        //
+        // Переменная trajectory сохранена для совместимости
+        // с существующим кодом визуализации.
+        trajectory =
+            trajectoryCalculator.getFusedTrajectory();
 
         // ====================================================
         // КОНСОЛЬНЫЙ ВЫВОД
@@ -847,6 +1054,40 @@ int main()
             << binsErrorRadius << " px"
             << endl;
 
+        // ====================================================
+        // ДОБАВЛЕНО:
+        // ИНФОРМАЦИЯ О ТРАЕКТОРИИ
+        // ====================================================
+        cout << "Motion data:       "
+            << (simulationData.available
+                ? "AVAILABLE"
+                : "STUB / NOT AVAILABLE")
+            << endl;
+
+        cout << "BINS velocity N:   "
+            << binsVelocityNorth
+            << " m/s" << endl;
+
+        cout << "BINS velocity E:   "
+            << binsVelocityEast
+            << " m/s" << endl;
+
+        cout << "BINS velocity U:   "
+            << binsVelocityUp
+            << " m/s" << endl;
+
+        cout << "Flight distance:   "
+            << fixed << setprecision(1)
+            << trajectoryCalculator.getDistancePixels()
+            << " px"
+            << endl;
+
+        cout << "SIFT correction:   "
+            << trajectoryCalculator
+            .getLastCorrectionPixels()
+            << " px"
+            << endl;
+
         if (initialPositionFound) {
             cout << "Position:          ("
                 << cvRound(fusedPosition.x)
@@ -864,24 +1105,51 @@ int main()
         trajectoryFile
             << frameID << "\t"
             << currentTime << "\t"
+
             << (siftValid
                 ? siftPosition.x
                 : -1.0f) << "\t"
+
             << (siftValid
                 ? siftPosition.y
                 : -1.0f) << "\t"
+
             << (initialPositionFound
                 ? binsPosition.x
                 : -1.0f) << "\t"
+
             << (initialPositionFound
                 ? binsPosition.y
                 : -1.0f) << "\t"
+
             << binsErrorRadius << "\t"
             << goodMatchesCount << "\t"
             << inlierCount << "\t"
             << inlierRatio << "\t"
             << siftValid << "\t"
-            << mode << "\n";
+            << mode << "\t"
+
+            // ДОБАВЛЕНО:
+            << (trajectoryCalculator.isInitialized()
+                ? fusedPosition.x
+                : -1.0f) << "\t"
+
+            << (trajectoryCalculator.isInitialized()
+                ? fusedPosition.y
+                : -1.0f) << "\t"
+
+            << simulationData.available << "\t"
+            << binsVelocityNorth << "\t"
+            << binsVelocityEast << "\t"
+            << binsVelocityUp << "\t"
+
+            << trajectoryCalculator
+            .getDistancePixels() << "\t"
+
+            << trajectoryCalculator
+            .getLastCorrectionPixels()
+
+            << "\n";
 
         // ====================================================
         // ВИЗУАЛИЗАЦИЯ
@@ -1013,16 +1281,44 @@ int main()
                 LINE_AA);
         }
 
-        // Траектория.
+        // ====================================================
+        // ОБЪЕДИНЁННАЯ ТРАЕКТОРИЯ
+        //
+        // Пока симуляции нет, полностью совпадает
+        // с траекторией SIFT.
+        // ====================================================
         for (size_t i = 1;
             i < trajectory.size();
             i++) {
+
             line(
                 result,
                 trajectory[i - 1],
                 trajectory[i],
                 Scalar(255, 255, 0),
                 2,
+                LINE_AA);
+        }
+
+        // ====================================================
+        // ДОБАВЛЕНО:
+        // ОТДЕЛЬНАЯ ТРАЕКТОРИЯ БИНС
+        //
+        // Она появится только после подключения симуляции.
+        // ====================================================
+        const vector<Point2f>& binsTrajectory =
+            trajectoryCalculator.getBinsTrajectory();
+
+        for (size_t i = 1;
+            i < binsTrajectory.size();
+            i++) {
+
+            line(
+                result,
+                binsTrajectory[i - 1],
+                binsTrajectory[i],
+                Scalar(255, 0, 255),
+                1,
                 LINE_AA);
         }
 
@@ -1148,10 +1444,13 @@ int main()
         sprintf_s(
             text,
             sizeof(text),
-            "BINS radius: %.1f px | Lost frames: %d | Frame scale: %.2f",
+            "BINS radius: %.1f px | Lost: %d | Scale: %.2f | Motion: %s",
             binsErrorRadius,
             lostFrames,
-            frameScale);
+            frameScale,
+            simulationData.available
+            ? "BINS+SIFT"
+            : "SIFT ONLY");
 
         putText(
             result,
@@ -1167,9 +1466,13 @@ int main()
             sprintf_s(
                 text,
                 sizeof(text),
-                "Position: (%.1f, %.1f) px",
+                "Position: (%.1f, %.1f) px | Distance: %.1f px | Correction: %.1f px",
                 fusedPosition.x,
-                fusedPosition.y);
+                fusedPosition.y,
+                trajectoryCalculator
+                .getDistancePixels(),
+                trajectoryCalculator
+                .getLastCorrectionPixels());
 
             putText(
                 result,
@@ -1227,6 +1530,19 @@ int main()
     cout << "Success:         "
         << fixed << setprecision(1)
         << successPercent << "%"
+        << endl;
+
+    // ДОБАВЛЕНО:
+    cout << "Flight distance: "
+        << fixed << setprecision(1)
+        << trajectoryCalculator.getDistancePixels()
+        << " px"
+        << endl;
+
+    cout << "Motion data:     "
+        << (trajectoryCalculator.hasMotionData()
+            ? "AVAILABLE"
+            : "NOT AVAILABLE / SIFT ONLY")
         << endl;
 
     cout << "========================================" << endl;
