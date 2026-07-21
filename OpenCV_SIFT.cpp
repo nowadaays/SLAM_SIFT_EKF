@@ -4,450 +4,23 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
 
-#include <iostream>
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
-#include <algorithm>
-#include <cmath>
-#include <vector>
+#include <iostream>
 #include <string>
+#include <vector>
 
+#include "ApplicationConfig.h"
+#include "FlightSimulationProvider.h"
 #include "INS.h"
-
-// ДОБАВЛЕНО:
-// Отдельный класс расчёта траектории.
 #include "TrajectoryCalculator.h"
+#include "VisionUtils.h"
 
 using namespace cv;
 using namespace std;
-
-// ============================================================
-// ПОЛНЫЕ ПУТИ К ФАЙЛАМ
-// ============================================================
-const string MAP_PATH =
-"C:\\Diplom\\OpenCV_SIFT\\x64\\Debug\\map.jpg";
-
-const string VIDEO_PATH =
-"C:\\Diplom\\OpenCV_SIFT\\x64\\Debug\\video.mp4";
-
-const string TRAJECTORY_PATH =
-"C:\\Diplom\\OpenCV_SIFT\\x64\\Debug\\trajectory.txt";
-
-// ============================================================
-// ПАРАМЕТРЫ SIFT
-// ============================================================
-constexpr int SIFT_FEATURE_COUNT = 5000;
-constexpr double SIFT_CONTRAST_THRESHOLD = 0.015;
-constexpr double SIFT_EDGE_THRESHOLD = 15.0;
-
-constexpr float LOWE_RATIO = 0.82f;
-
-constexpr int MIN_MATCHES = 5;
-constexpr int MIN_INLIERS = 4;
-constexpr double MIN_INLIER_RATIO = 0.50;
-
-// Минимальное распределение совпадений по кадру.
-constexpr double MIN_POINT_SPREAD = 0.12;
-
-// ============================================================
-// ПАРАМЕТРЫ ОБЛАСТИ БИНС
-// ============================================================
-constexpr double BINS_INITIAL_RADIUS_PX = 160.0;
-constexpr double BINS_MIN_RADIUS_PX = 100.0;
-constexpr double BINS_MAX_RADIUS_PX = 700.0;
-constexpr double BINS_RADIUS_GROWTH_PX_PER_SEC = 70.0;
-constexpr double LOW_FEATURE_EXPANSION_PX = 10.0;
-
-constexpr int MIN_MAP_KEYPOINTS = 15;
-
-// ============================================================
-// ДОБАВЛЕНО:
-// ВХОДНЫЕ ДАННЫЕ БУДУЩЕЙ СИМУЛЯЦИИ
-// ============================================================
-
-struct FlightSimulationData {
-    // false — симуляция пока отсутствует.
-    // В таком состоянии данные не влияют на траекторию.
-    bool available = false;
-
-    Vector3d acceleration;
-    Vector3d angularVelocity;
-
-    double altitude = 0.0;
-    double verticalVelocity = 0.0;
-};
-
-// ============================================================
-// ДОБАВЛЕНО:
-// ЗАГЛУШКА БУДУЩЕГО СИМУЛЯТОРА
-//
-// Сейчас функция возвращает available=false.
-//
-// Когда появится симулятор полёта, необходимо будет изменить
-// только содержимое этой функции и передать:
-//
-// acceleration      — показания акселерометра;
-// angularVelocity   — показания гироскопа;
-// altitude          — высоту;
-// verticalVelocity  — вертикальную скорость.
-//
-// Весь остальной расчёт траектории менять не потребуется.
-// ============================================================
-FlightSimulationData getFlightSimulationData(
-    double time,
-    double dt)
-{
-    (void)time;
-    (void)dt;
-
-    FlightSimulationData data;
-
-    data.available = false;
-
-    // Заглушки не используются, пока available == false.
-    data.acceleration =
-        Vector3d(0.0, 0.0, 9.81);
-
-    data.angularVelocity =
-        Vector3d(0.0, 0.0, 0.0);
-
-    data.altitude = 0.0;
-    data.verticalVelocity = 0.0;
-
-    /*
-    // ПРИМЕР БУДУЩЕГО ПОДКЛЮЧЕНИЯ:
-
-    simulator.update(dt);
-
-    data.available = true;
-
-    data.acceleration =
-        simulator.getAcceleration();
-
-    data.angularVelocity =
-        simulator.getAngularVelocity();
-
-    data.altitude =
-        simulator.getAltitude();
-
-    data.verticalVelocity =
-        simulator.getVerticalVelocity();
-    */
-
-    return data;
-}
-
-// ============================================================
-// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-// ============================================================
-
-bool pointInsideImage(
-    const Point2f& point,
-    const Mat& image)
-{
-    return std::isfinite(point.x) &&
-        std::isfinite(point.y) &&
-        point.x >= 0.0f &&
-        point.x < static_cast<float>(image.cols) &&
-        point.y >= 0.0f &&
-        point.y < static_cast<float>(image.rows);
-}
-
-// Подготовка изображения с помощью CLAHE.
-Mat preprocessImage(
-    const Mat& gray,
-    const Ptr<CLAHE>& clahe)
-{
-    Mat result;
-
-    clahe->apply(gray, result);
-
-    // Слабое размытие только для уменьшения шума.
-    GaussianBlur(
-        result,
-        result,
-        Size(3, 3),
-        0.4);
-
-    return result;
-}
-
-// Маленькие кадры увеличиваются перед SIFT.
-// Координаты центра далее берутся уже в увеличенном кадре.
-Mat upscaleSmallFrame(
-    const Mat& frame,
-    double& scale)
-{
-    int minimumSide =
-        std::min(frame.cols, frame.rows);
-
-    scale = 1.0;
-
-    // Для кадров размером около 90x90 получится увеличение x4.
-    if (minimumSide < 360) {
-        scale =
-            360.0 /
-            static_cast<double>(minimumSide);
-
-        scale = std::min(scale, 4.0);
-    }
-
-    if (scale <= 1.0) {
-        return frame.clone();
-    }
-
-    Mat enlarged;
-
-    resize(
-        frame,
-        enlarged,
-        Size(),
-        scale,
-        scale,
-        INTER_CUBIC);
-
-    return enlarged;
-}
-
-// Взаимная проверка совпадений:
-//
-// точка карты должна выбрать точку кадра,
-// а эта точка кадра должна выбрать ту же точку карты.
-vector<DMatch> findMutualMatches(
-    const Mat& mapDescriptors,
-    const Mat& frameDescriptors,
-    BFMatcher& matcher)
-{
-    vector<vector<DMatch>> mapToFrame;
-    vector<vector<DMatch>> frameToMap;
-
-    matcher.knnMatch(
-        mapDescriptors,
-        frameDescriptors,
-        mapToFrame,
-        2);
-
-    matcher.knnMatch(
-        frameDescriptors,
-        mapDescriptors,
-        frameToMap,
-        2);
-
-    vector<DMatch> matches;
-
-    for (size_t mapIndex = 0;
-        mapIndex < mapToFrame.size();
-        mapIndex++) {
-
-        const vector<DMatch>& forward =
-            mapToFrame[mapIndex];
-
-        if (forward.size() < 2) {
-            continue;
-        }
-
-        if (forward[0].distance >=
-            LOWE_RATIO * forward[1].distance) {
-            continue;
-        }
-
-        const DMatch& bestForward =
-            forward[0];
-
-        int frameIndex =
-            bestForward.trainIdx;
-
-        if (frameIndex < 0 ||
-            frameIndex >=
-            static_cast<int>(
-                frameToMap.size())) {
-            continue;
-        }
-
-        const vector<DMatch>& reverse =
-            frameToMap[frameIndex];
-
-        if (reverse.size() < 2) {
-            continue;
-        }
-
-        if (reverse[0].distance >=
-            LOWE_RATIO * reverse[1].distance) {
-            continue;
-        }
-
-        // reverse[0].trainIdx — индекс точки карты.
-        if (reverse[0].trainIdx !=
-            bestForward.queryIdx) {
-            continue;
-        }
-
-        matches.push_back(bestForward);
-    }
-
-    sort(
-        matches.begin(),
-        matches.end(),
-        [](const DMatch& left,
-            const DMatch& right) {
-                return left.distance <
-                    right.distance;
-        });
-
-    return matches;
-}
-
-// Определение позиции центра кадра на карте.
-bool estimateMapPosition(
-    const vector<KeyPoint>& mapKeypoints,
-    const vector<KeyPoint>& frameKeypoints,
-    const vector<DMatch>& matches,
-    const Size& frameSize,
-    Point2f& mapPosition,
-    int& inlierCount,
-    double& inlierRatio,
-    string& failureReason)
-{
-    inlierCount = 0;
-    inlierRatio = 0.0;
-
-    if (matches.size() <
-        static_cast<size_t>(MIN_MATCHES)) {
-        failureReason =
-            "Not enough mutual matches";
-        return false;
-    }
-
-    vector<Point2f> mapPoints;
-    vector<Point2f> framePoints;
-
-    mapPoints.reserve(matches.size());
-    framePoints.reserve(matches.size());
-
-    for (const DMatch& match : matches) {
-        mapPoints.push_back(
-            mapKeypoints[
-                match.queryIdx].pt);
-
-        framePoints.push_back(
-            frameKeypoints[
-                match.trainIdx].pt);
-    }
-
-    Mat inlierMask;
-
-    // Для вертикальной камеры и плоской карты устойчивое
-    // аффинное преобразование обычно точнее гомографии
-    // при небольшом количестве точек.
-    Mat affineTransform =
-        estimateAffinePartial2D(
-            framePoints,
-            mapPoints,
-            inlierMask,
-            RANSAC,
-            3.0,
-            3000,
-            0.995,
-            10);
-
-    if (affineTransform.empty() ||
-        inlierMask.empty()) {
-        failureReason =
-            "Affine RANSAC failed";
-        return false;
-    }
-
-    inlierCount =
-        countNonZero(inlierMask);
-
-    inlierRatio =
-        static_cast<double>(inlierCount) /
-        static_cast<double>(matches.size());
-
-    if (inlierCount < MIN_INLIERS) {
-        failureReason =
-            "Not enough RANSAC inliers";
-        return false;
-    }
-
-    if (inlierRatio <
-        MIN_INLIER_RATIO) {
-        failureReason =
-            "Low RANSAC inlier ratio";
-        return false;
-    }
-
-    // Проверяем, что подтверждённые точки распределены
-    // по кадру, а не находятся в одном маленьком месте.
-    vector<Point2f> inlierFramePoints;
-
-    for (int i = 0;
-        i < static_cast<int>(
-            framePoints.size());
-        i++) {
-
-        if (inlierMask.at<uchar>(i) != 0) {
-            inlierFramePoints.push_back(
-                framePoints[i]);
-        }
-    }
-
-    if (inlierFramePoints.size() <
-        static_cast<size_t>(MIN_INLIERS)) {
-        failureReason =
-            "Invalid inlier points";
-        return false;
-    }
-
-    Rect pointBounds =
-        boundingRect(inlierFramePoints);
-
-    double spreadX =
-        static_cast<double>(
-            pointBounds.width) /
-        static_cast<double>(
-            frameSize.width);
-
-    double spreadY =
-        static_cast<double>(
-            pointBounds.height) /
-        static_cast<double>(
-            frameSize.height);
-
-    if (spreadX < MIN_POINT_SPREAD ||
-        spreadY < MIN_POINT_SPREAD) {
-        failureReason =
-            "RANSAC points are too clustered";
-        return false;
-    }
-
-    vector<Point2f> frameCenter = {
-        Point2f(
-            frameSize.width * 0.5f,
-            frameSize.height * 0.5f)
-    };
-
-    vector<Point2f> transformedCenter;
-
-    transform(
-        frameCenter,
-        transformedCenter,
-        affineTransform);
-
-    if (transformedCenter.empty()) {
-        failureReason =
-            "Center transformation failed";
-        return false;
-    }
-
-    mapPosition =
-        transformedCenter[0];
-
-    failureReason = "NONE";
-
-    return std::isfinite(mapPosition.x) &&
-        std::isfinite(mapPosition.y);
-}
+using namespace AppConfig;
+using namespace VisionUtils;
 
 int main()
 {
@@ -456,26 +29,22 @@ int main()
     cout << "========================================" << endl;
     cout << endl;
 
-    // ========================================================
-    // ИНИЦИАЛИЗАЦИЯ БИНС
-    // ========================================================
     INSConfig config;
     INS ins(config);
 
-    // ========================================================
-    // ДОБАВЛЕНО:
-    // ИНИЦИАЛИЗАЦИЯ КАЛЬКУЛЯТОРА ТРАЕКТОРИИ
-    // ========================================================
     TrajectoryConfig trajectoryConfig;
 
-    // Временная заглушка масштаба.
-    // После появления симуляции необходимо указать
-    // реальное количество пикселей на один метр.
-    trajectoryConfig.pixelsPerMeter = 3.0;
+    trajectoryConfig.pixelsPerMeter =
+        PIXELS_PER_METER;
 
-    trajectoryConfig.siftCorrectionGain = 0.75;
-    trajectoryConfig.minimumPointDistance = 0.5;
-    trajectoryConfig.maximumHistorySize = 300;
+    trajectoryConfig.siftCorrectionGain =
+        SIFT_CORRECTION_GAIN;
+
+    trajectoryConfig.minimumPointDistance =
+        MINIMUM_TRAJECTORY_POINT_DISTANCE;
+
+    trajectoryConfig.maximumHistorySize =
+        MAXIMUM_TRAJECTORY_HISTORY_SIZE;
 
     TrajectoryCalculator trajectoryCalculator(
         trajectoryConfig);
@@ -483,13 +52,12 @@ int main()
     double dt = 0.033;
     double currentTime = 0.0;
 
-    // Старые заглушки оставлены без изменений.
-    Vector3d acceleration(0.0, 0.0, 9.81);
-    Vector3d angularVelocity(0.0, 0.0, 0.0);
+    Vector3d acceleration(
+        0.0, 0.0, 9.81);
 
-    // ========================================================
-    // ЗАГРУЗКА КАРТЫ
-    // ========================================================
+    Vector3d angularVelocity(
+        0.0, 0.0, 0.0);
+
     cout << "Loading map..." << endl;
 
     Mat mapOriginal =
@@ -498,7 +66,9 @@ int main()
             IMREAD_GRAYSCALE);
 
     if (mapOriginal.empty()) {
-        cout << "ERROR: Failed to load map!" << endl;
+        cout << "ERROR: Failed to load map!"
+            << endl;
+
         cout << MAP_PATH << endl;
         return -1;
     }
@@ -507,15 +77,15 @@ int main()
         << mapOriginal.cols << "x"
         << mapOriginal.rows << endl;
 
-    // ========================================================
-    // ЗАГРУЗКА ВИДЕО
-    // ========================================================
     cout << "Loading video..." << endl;
 
-    VideoCapture cap(VIDEO_PATH);
+    VideoCapture cap(
+        VIDEO_PATH);
 
     if (!cap.isOpened()) {
-        cout << "ERROR: Failed to open video!" << endl;
+        cout << "ERROR: Failed to open video!"
+            << endl;
+
         cout << VIDEO_PATH << endl;
         return -1;
     }
@@ -530,9 +100,6 @@ int main()
     cout << "Video loaded. FPS: "
         << videoFPS << endl;
 
-    // ========================================================
-    // SIFT И CLAHE
-    // ========================================================
     Ptr<CLAHE> clahe =
         createCLAHE(
             2.0,
@@ -551,15 +118,11 @@ int main()
             SIFT_EDGE_THRESHOLD,
             1.6);
 
-    BFMatcher matcher(NORM_L2);
+    BFMatcher matcher(
+        NORM_L2);
 
-    // ========================================================
-    // ГЛОБАЛЬНЫЕ ТОЧКИ КАРТЫ
-    //
-    // Используются исключительно для начальной локализации.
-    // После определения начальной позиции они больше
-    // не участвуют в поиске.
-    // ========================================================
+    // Глобальные признаки используются только для
+    // определения начальной позиции.
     vector<KeyPoint> globalMapKeypoints;
     Mat globalMapDescriptors;
 
@@ -576,21 +139,24 @@ int main()
     if (globalMapDescriptors.empty()) {
         cout << "ERROR: Map has no SIFT descriptors."
             << endl;
+
         return -1;
     }
 
-    // ========================================================
-    // ПЕРЕМЕННЫЕ НАВИГАЦИИ
-    // ========================================================
     bool initialPositionFound = false;
     bool siftValid = false;
 
     int frameID = 0;
     int lostFrames = 0;
 
-    Point2f siftPosition(0.0f, 0.0f);
-    Point2f binsPosition(0.0f, 0.0f);
-    Point2f fusedPosition(0.0f, 0.0f);
+    Point2f siftPosition(
+        0.0f, 0.0f);
+
+    Point2f binsPosition(
+        0.0f, 0.0f);
+
+    Point2f fusedPosition(
+        0.0f, 0.0f);
 
     double binsErrorRadius =
         BINS_INITIAL_RADIUS_PX;
@@ -602,30 +168,21 @@ int main()
     string failureReason =
         "Initial localization required";
 
-    // Переменная сохранена, чтобы не менять
-    // существующую визуализацию.
     vector<Point2f> trajectory;
 
-    // ========================================================
-    // СТАТИСТИКА
-    // ========================================================
     double processedFrames = 0.0;
     double successfulFrames = 0.0;
 
-    // ========================================================
-    // ФАЙЛ ТРАЕКТОРИИ
-    // ========================================================
     ofstream trajectoryFile(
         TRAJECTORY_PATH);
 
     if (!trajectoryFile.is_open()) {
         cout << "ERROR: Cannot create trajectory file."
             << endl;
+
         return -1;
     }
 
-    // ДОБАВЛЕНО:
-    // Новые поля итоговой траектории, скорости и коррекции.
     trajectoryFile
         << "frame\ttime\t"
         << "SIFT_x\tSIFT_y\t"
@@ -641,9 +198,6 @@ int main()
     cout << "Starting processing..." << endl;
     cout << endl;
 
-    // ========================================================
-    // ГЛАВНЫЙ ЦИКЛ
-    // ========================================================
     while (true) {
         Mat frame;
 
@@ -658,17 +212,11 @@ int main()
         processedFrames++;
         currentTime += dt;
 
-        // ====================================================
-        // ДОБАВЛЕНО:
-        // ПОЛУЧЕНИЕ ДАННЫХ БУДУЩЕЙ СИМУЛЯЦИИ
-        // ====================================================
         FlightSimulationData simulationData =
             getFlightSimulationData(
                 currentTime,
                 dt);
 
-        // Пока симуляции нет, INS получает те же данные,
-        // которые использовались в рабочей версии программы.
         Vector3d currentAcceleration =
             simulationData.available
             ? simulationData.acceleration
@@ -689,8 +237,6 @@ int main()
             ? simulationData.verticalVelocity
             : 0.0;
 
-        // Обновление математической модели БИНС.
-        // При отсутствии симуляции сохранено старое поведение.
         ins.update(
             currentAcceleration,
             currentAngularVelocity,
@@ -699,10 +245,6 @@ int main()
             currentAltitude,
             currentVerticalVelocity);
 
-        // ====================================================
-        // ДОБАВЛЕНО:
-        // ПОЛУЧЕНИЕ СКОРОСТИ БИНС
-        // ====================================================
         double binsVelocityNorth = 0.0;
         double binsVelocityUp = 0.0;
         double binsVelocityEast = 0.0;
@@ -712,14 +254,8 @@ int main()
             binsVelocityUp,
             binsVelocityEast);
 
-        // ====================================================
-        // ДОБАВЛЕНО:
-        // ПРОГНОЗ ТРАЕКТОРИИ ПО БИНС
-        // ====================================================
         TrajectoryMotionData motionData;
 
-        // Пока симуляции нет, available=false,
-        // поэтому предсказание не изменяет позицию.
         motionData.available =
             simulationData.available;
 
@@ -737,19 +273,16 @@ int main()
         trajectoryCalculator.predict(
             motionData);
 
-        // После появления симуляции binsPosition будет
-        // перемещаться по скорости БИНС.
         if (trajectoryCalculator.isInitialized()) {
             binsPosition =
-                trajectoryCalculator.getBinsPosition();
+                trajectoryCalculator
+                .getBinsPosition();
 
             fusedPosition =
-                trajectoryCalculator.getFusedPosition();
+                trajectoryCalculator
+                .getFusedPosition();
         }
 
-        // ====================================================
-        // ПОДГОТОВКА КАДРА
-        // ====================================================
         Mat gray;
 
         cvtColor(
@@ -778,9 +311,6 @@ int main()
             frameKeypoints,
             frameDescriptors);
 
-        // ====================================================
-        // ВЫБОР ОБЛАСТИ ПОИСКА
-        // ====================================================
         bool globalInitializationMode =
             !initialPositionFound;
 
@@ -796,8 +326,6 @@ int main()
             binsErrorRadius;
 
         if (globalInitializationMode) {
-            // Глобальный поиск разрешён только до первой
-            // надёжной локализации.
             activeMapKeypoints =
                 globalMapKeypoints;
 
@@ -805,12 +333,11 @@ int main()
                 globalMapDescriptors;
         }
         else {
-            // После инициализации поиск карты выполняется
-            // строго внутри области ошибки БИНС.
             circle(
                 binsMask,
                 binsPosition,
-                cvRound(currentSearchRadius),
+                cvRound(
+                    currentSearchRadius),
                 Scalar(255),
                 FILLED,
                 LINE_AA);
@@ -831,9 +358,6 @@ int main()
 
         vector<DMatch> goodMatches;
 
-        // ====================================================
-        // СОПОСТАВЛЕНИЕ
-        // ====================================================
         if (frameDescriptors.empty()) {
             failureReason =
                 "Frame descriptors are empty";
@@ -872,13 +396,10 @@ int main()
                     processedMap)) {
 
                 positionEstimated = false;
-
                 failureReason =
                     "Position outside map";
             }
 
-            // После инициализации позиция также обязана
-            // находиться внутри области ошибки БИНС.
             if (positionEstimated &&
                 initialPositionFound) {
 
@@ -891,7 +412,6 @@ int main()
                     currentSearchRadius) {
 
                     positionEstimated = false;
-
                     failureReason =
                         "Position outside BINS area";
                 }
@@ -901,22 +421,17 @@ int main()
                 siftPosition =
                     candidatePosition;
 
-                // ============================================
-                // ДОБАВЛЕНО:
-                // КОРРЕКЦИЯ ТРАЕКТОРИИ ПО SIFT
-                //
-                // Без симуляции результат полностью совпадает
-                // с candidatePosition, как в рабочей версии.
-                // ============================================
                 trajectoryCalculator.correct(
                     true,
                     siftPosition);
 
                 binsPosition =
-                    trajectoryCalculator.getBinsPosition();
+                    trajectoryCalculator
+                    .getBinsPosition();
 
                 fusedPosition =
-                    trajectoryCalculator.getFusedPosition();
+                    trajectoryCalculator
+                    .getFusedPosition();
 
                 siftValid = true;
                 successfulFrames++;
@@ -946,10 +461,6 @@ int main()
             }
         }
 
-        // ====================================================
-        // ДОБАВЛЕНО:
-        // ОБРАБОТКА SIFT LOST В КАЛЬКУЛЯТОРЕ ТРАЕКТОРИИ
-        // ====================================================
         if (!siftValid) {
             trajectoryCalculator.correct(
                 false,
@@ -957,16 +468,15 @@ int main()
 
             if (trajectoryCalculator.isInitialized()) {
                 binsPosition =
-                    trajectoryCalculator.getBinsPosition();
+                    trajectoryCalculator
+                    .getBinsPosition();
 
                 fusedPosition =
-                    trajectoryCalculator.getFusedPosition();
+                    trajectoryCalculator
+                    .getFusedPosition();
             }
         }
 
-        // ====================================================
-        // РОСТ ОБЛАСТИ ПРИ ПОТЕРЕ SIFT
-        // ====================================================
         if (!siftValid) {
             lostFrames++;
 
@@ -977,6 +487,7 @@ int main()
 
                 if (activeMapKeypoints.size() <
                     MIN_MAP_KEYPOINTS) {
+
                     binsErrorRadius +=
                         LOW_FEATURE_EXPANSION_PX;
                 }
@@ -988,21 +499,10 @@ int main()
             }
         }
 
-        // ====================================================
-        // ТРАЕКТОРИЯ
-        // ====================================================
-        // ДОБАВЛЕНО:
-        // Получаем уже рассчитанную объединённую траекторию
-        // из отдельного класса.
-        //
-        // Переменная trajectory сохранена для совместимости
-        // с существующим кодом визуализации.
         trajectory =
-            trajectoryCalculator.getFusedTrajectory();
+            trajectoryCalculator
+            .getFusedTrajectory();
 
-        // ====================================================
-        // КОНСОЛЬНЫЙ ВЫВОД
-        // ====================================================
         string mode =
             globalInitializationMode
             ? "INITIAL_GLOBAL_SEARCH"
@@ -1054,10 +554,6 @@ int main()
             << binsErrorRadius << " px"
             << endl;
 
-        // ====================================================
-        // ДОБАВЛЕНО:
-        // ИНФОРМАЦИЯ О ТРАЕКТОРИИ
-        // ====================================================
         cout << "Motion data:       "
             << (simulationData.available
                 ? "AVAILABLE"
@@ -1078,7 +574,8 @@ int main()
 
         cout << "Flight distance:   "
             << fixed << setprecision(1)
-            << trajectoryCalculator.getDistancePixels()
+            << trajectoryCalculator
+            .getDistancePixels()
             << " px"
             << endl;
 
@@ -1099,9 +596,6 @@ int main()
 
         cout << endl;
 
-        // ====================================================
-        // ЗАПИСЬ ТРАЕКТОРИИ
-        // ====================================================
         trajectoryFile
             << frameID << "\t"
             << currentTime << "\t"
@@ -1129,7 +623,6 @@ int main()
             << siftValid << "\t"
             << mode << "\t"
 
-            // ДОБАВЛЕНО:
             << (trajectoryCalculator.isInitialized()
                 ? fusedPosition.x
                 : -1.0f) << "\t"
@@ -1151,9 +644,6 @@ int main()
 
             << "\n";
 
-        // ====================================================
-        // ВИЗУАЛИЗАЦИЯ
-        // ====================================================
         Mat mapColor;
         Mat frameColor;
 
@@ -1167,8 +657,6 @@ int main()
             frameColor,
             COLOR_GRAY2BGR);
 
-        // Область ошибки показывается только после
-        // начальной глобальной локализации.
         if (initialPositionFound) {
             Mat overlay =
                 mapColor.clone();
@@ -1176,7 +664,8 @@ int main()
             circle(
                 overlay,
                 binsPosition,
-                cvRound(currentSearchRadius),
+                cvRound(
+                    currentSearchRadius),
                 Scalar(0, 0, 255),
                 FILLED,
                 LINE_AA);
@@ -1192,7 +681,8 @@ int main()
             circle(
                 mapColor,
                 binsPosition,
-                cvRound(currentSearchRadius),
+                cvRound(
+                    currentSearchRadius),
                 Scalar(0, 0, 255),
                 2,
                 LINE_AA);
@@ -1234,18 +724,17 @@ int main()
                     frameColor.cols,
                     frameColor.rows)));
 
-        // Линии совпадений.
         size_t matchesToDraw =
             std::min(
                 static_cast<size_t>(40),
                 goodMatches.size());
 
-        for (size_t i = 0;
-            i < matchesToDraw;
-            i++) {
+        for (size_t index = 0;
+            index < matchesToDraw;
+            index++) {
 
             const DMatch& match =
-                goodMatches[i];
+                goodMatches[index];
 
             Point2f mapPoint =
                 activeMapKeypoints[
@@ -1281,42 +770,31 @@ int main()
                 LINE_AA);
         }
 
-        // ====================================================
-        // ОБЪЕДИНЁННАЯ ТРАЕКТОРИЯ
-        //
-        // Пока симуляции нет, полностью совпадает
-        // с траекторией SIFT.
-        // ====================================================
-        for (size_t i = 1;
-            i < trajectory.size();
-            i++) {
+        for (size_t index = 1;
+            index < trajectory.size();
+            index++) {
 
             line(
                 result,
-                trajectory[i - 1],
-                trajectory[i],
+                trajectory[index - 1],
+                trajectory[index],
                 Scalar(255, 255, 0),
                 2,
                 LINE_AA);
         }
 
-        // ====================================================
-        // ДОБАВЛЕНО:
-        // ОТДЕЛЬНАЯ ТРАЕКТОРИЯ БИНС
-        //
-        // Она появится только после подключения симуляции.
-        // ====================================================
         const vector<Point2f>& binsTrajectory =
-            trajectoryCalculator.getBinsTrajectory();
+            trajectoryCalculator
+            .getBinsTrajectory();
 
-        for (size_t i = 1;
-            i < binsTrajectory.size();
-            i++) {
+        for (size_t index = 1;
+            index < binsTrajectory.size();
+            index++) {
 
             line(
                 result,
-                binsTrajectory[i - 1],
-                binsTrajectory[i],
+                binsTrajectory[index - 1],
+                binsTrajectory[index],
                 Scalar(255, 0, 255),
                 1,
                 LINE_AA);
@@ -1370,11 +848,12 @@ int main()
                 LINE_AA);
         }
 
-        // Информационная панель.
         rectangle(
             result,
             Point(0, contentHeight),
-            Point(result.cols, result.rows),
+            Point(
+                result.cols,
+                result.rows),
             Scalar(35, 35, 35),
             FILLED);
 
@@ -1489,7 +968,8 @@ int main()
             "Drone Navigation - Reliable BINS + SIFT",
             result);
 
-        int key = waitKey(1);
+        int key =
+            waitKey(1);
 
         if (key == 27) {
             break;
@@ -1499,7 +979,8 @@ int main()
             key == 'S') {
 
             string screenshotPath =
-                "C:\\Diplom\\OpenCV_SIFT\\x64\\Debug\\screenshot_" +
+                string(SCREENSHOT_DIRECTORY) +
+                "screenshot_" +
                 to_string(frameID) +
                 ".png";
 
@@ -1532,10 +1013,10 @@ int main()
         << successPercent << "%"
         << endl;
 
-    // ДОБАВЛЕНО:
     cout << "Flight distance: "
         << fixed << setprecision(1)
-        << trajectoryCalculator.getDistancePixels()
+        << trajectoryCalculator
+        .getDistancePixels()
         << " px"
         << endl;
 
