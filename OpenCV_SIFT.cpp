@@ -5,6 +5,7 @@
 #include <opencv2/features2d.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -170,6 +171,22 @@ int main()
 
     vector<Point2f> trajectory;
 
+    // Истинная траектория симулятора отображается на карте
+    // относительно точки первой успешной локализации SIFT.
+    bool simulationMapAnchorInitialized = false;
+
+    Point2f simulationMapAnchor(
+        0.0f, 0.0f);
+
+    SimulatedFlightState simulationTrueAnchor;
+
+    Point2f trueSimulationMapPosition(
+        0.0f, 0.0f);
+
+    vector<Point2f> trueSimulationTrajectory;
+
+    FlightSimulationData lastSimulationData;
+
     double processedFrames = 0.0;
     double successfulFrames = 0.0;
 
@@ -192,7 +209,12 @@ int main()
         << "Fused_x\tFused_y\t"
         << "motion_available\t"
         << "velocity_n\tvelocity_e\tvelocity_u\t"
-        << "distance_px\tcorrection_px\n";
+        << "distance_px\tcorrection_px\t"
+        << "sim_phase\t"
+        << "true_x_m\ttrue_y_m\ttrue_z_m\t"
+        << "true_vx\ttrue_vy\ttrue_vz\t"
+        << "sim_bins_x_m\tsim_bins_y_m\tsim_bins_z_m\t"
+        << "sim_error_m\theading_error_deg\n";
 
     cout << endl;
     cout << "Starting processing..." << endl;
@@ -216,6 +238,9 @@ int main()
             getFlightSimulationData(
                 currentTime,
                 dt);
+
+        lastSimulationData =
+            simulationData;
 
         Vector3d currentAcceleration =
             simulationData.available
@@ -253,6 +278,20 @@ int main()
             binsVelocityNorth,
             binsVelocityUp,
             binsVelocityEast);
+
+        // При активной симуляции для расчёта траектории
+        // используются скорости модельной БИНС. Сам класс INS
+        // и его исходные файлы при этом не изменяются.
+        if (simulationData.available) {
+            binsVelocityNorth =
+                simulationData.binsState.velocityX;
+
+            binsVelocityEast =
+                simulationData.binsState.velocityY;
+
+            binsVelocityUp =
+                simulationData.binsState.velocityZ;
+        }
 
         TrajectoryMotionData motionData;
 
@@ -503,98 +542,225 @@ int main()
             trajectoryCalculator
             .getFusedTrajectory();
 
+        double simulationHorizontalErrorMeters = 0.0;
+        double simulationPositionErrorMeters = 0.0;
+        double simulationHeadingErrorDegrees = 0.0;
+
+        if (simulationData.available) {
+            const double errorX =
+                simulationData.binsState.x -
+                simulationData.trueState.x;
+
+            const double errorY =
+                simulationData.binsState.y -
+                simulationData.trueState.y;
+
+            const double errorZ =
+                simulationData.binsState.z -
+                simulationData.trueState.z;
+
+            simulationHorizontalErrorMeters =
+                std::sqrt(
+                    errorX * errorX +
+                    errorY * errorY);
+
+            simulationPositionErrorMeters =
+                std::sqrt(
+                    errorX * errorX +
+                    errorY * errorY +
+                    errorZ * errorZ);
+
+            const double headingDifference =
+                std::atan2(
+                    std::sin(
+                        simulationData.binsState.heading -
+                        simulationData.trueState.heading),
+                    std::cos(
+                        simulationData.binsState.heading -
+                        simulationData.trueState.heading));
+
+            simulationHeadingErrorDegrees =
+                headingDifference *
+                180.0 /
+                3.14159265358979323846;
+        }
+
+        if (simulationData.available &&
+            initialPositionFound) {
+
+            if (!simulationMapAnchorInitialized) {
+                simulationMapAnchorInitialized = true;
+                simulationMapAnchor = fusedPosition;
+                simulationTrueAnchor =
+                    simulationData.trueState;
+
+                trueSimulationTrajectory.clear();
+            }
+
+            // Восток модели соответствует X изображения,
+            // север — отрицательному Y изображения.
+            trueSimulationMapPosition.x =
+                simulationMapAnchor.x +
+                static_cast<float>(
+                    (simulationData.trueState.y -
+                        simulationTrueAnchor.y) *
+                    PIXELS_PER_METER);
+
+            trueSimulationMapPosition.y =
+                simulationMapAnchor.y -
+                static_cast<float>(
+                    (simulationData.trueState.x -
+                        simulationTrueAnchor.x) *
+                    PIXELS_PER_METER);
+
+            if (trueSimulationTrajectory.empty() ||
+                norm(
+                    trueSimulationMapPosition -
+                    trueSimulationTrajectory.back()) >=
+                MINIMUM_TRAJECTORY_POINT_DISTANCE) {
+
+                trueSimulationTrajectory.push_back(
+                    trueSimulationMapPosition);
+
+                if (trueSimulationTrajectory.size() >
+                    static_cast<size_t>(
+                        MAXIMUM_TRAJECTORY_HISTORY_SIZE)) {
+
+                    trueSimulationTrajectory.erase(
+                        trueSimulationTrajectory.begin());
+                }
+            }
+        }
+
         string mode =
             globalInitializationMode
             ? "INITIAL_GLOBAL_SEARCH"
             : "BINS_AREA_ONLY";
 
+        const double trueHorizontalSpeed =
+            std::sqrt(
+                simulationData.trueState.velocityX *
+                simulationData.trueState.velocityX +
+                simulationData.trueState.velocityY *
+                simulationData.trueState.velocityY);
+
         cout << "----------------------------------------"
             << endl;
 
-        cout << "Frame:             "
-            << frameID << endl;
+        cout << fixed << setprecision(2);
 
-        cout << "Mode:              "
+        cout << "Frame / time:       "
+            << frameID << " / "
+            << currentTime << " s" << endl;
+
+        cout << "Processing mode:    "
             << mode << endl;
 
-        cout << "SIFT:              "
+        cout << "Simulation:         "
+            << (simulationData.available
+                ? "ACTIVE"
+                : "OFF")
+            << endl;
+
+        cout << "Flight phase:       "
+            << simulationData.phase << endl;
+
+        cout << "True position N/E/H: "
+            << simulationData.trueState.x << " / "
+            << simulationData.trueState.y << " / "
+            << simulationData.trueState.z
+            << " m" << endl;
+
+        cout << "True velocity N/E/U: "
+            << simulationData.trueState.velocityX << " / "
+            << simulationData.trueState.velocityY << " / "
+            << simulationData.trueState.velocityZ
+            << " m/s" << endl;
+
+        cout << "True ground speed:  "
+            << trueHorizontalSpeed
+            << " m/s" << endl;
+
+        cout << "BINS position N/E/H: "
+            << simulationData.binsState.x << " / "
+            << simulationData.binsState.y << " / "
+            << simulationData.binsState.z
+            << " m" << endl;
+
+        cout << "BINS velocity N/E/U: "
+            << binsVelocityNorth << " / "
+            << binsVelocityEast << " / "
+            << binsVelocityUp
+            << " m/s" << endl;
+
+        cout << "BINS error H / 3D: "
+            << simulationHorizontalErrorMeters << " / "
+            << simulationPositionErrorMeters
+            << " m" << endl;
+
+        cout << "Heading error:      "
+            << simulationHeadingErrorDegrees
+            << " deg" << endl;
+
+        cout << "True accel X/Y/Z:   "
+            << simulationData.trueAcceleration.x << " / "
+            << simulationData.trueAcceleration.y << " / "
+            << simulationData.trueAcceleration.z
+            << " m/s^2" << endl;
+
+        cout << "IMU accel X/Y/Z:    "
+            << simulationData.acceleration.x << " / "
+            << simulationData.acceleration.y << " / "
+            << simulationData.acceleration.z
+            << " m/s^2" << endl;
+
+        cout << "True gyro X/Y/Z:    "
+            << simulationData.trueAngularVelocity.x << " / "
+            << simulationData.trueAngularVelocity.y << " / "
+            << simulationData.trueAngularVelocity.z
+            << " rad/s" << endl;
+
+        cout << "IMU gyro X/Y/Z:     "
+            << simulationData.angularVelocity.x << " / "
+            << simulationData.angularVelocity.y << " / "
+            << simulationData.angularVelocity.z
+            << " rad/s" << endl;
+
+        cout << "SIFT:               "
             << (siftValid
                 ? "ACTIVE"
                 : "LOST")
             << endl;
 
-        cout << "Reason:            "
-            << failureReason << endl;
+        if (!siftValid) {
+            cout << "SIFT reason:        "
+                << failureReason << endl;
+        }
 
-        cout << "Frame size:        "
-            << gray.cols << "x"
-            << gray.rows << endl;
+        cout << "Matches / inliers:  "
+            << goodMatchesCount << " / "
+            << inlierCount
+            << " (" << inlierRatio << ")"
+            << endl;
 
-        cout << "SIFT frame size:   "
-            << processedFrame.cols << "x"
-            << processedFrame.rows << endl;
-
-        cout << "Frame keypoints:   "
-            << frameKeypoints.size() << endl;
-
-        cout << "Map keypoints:     "
-            << activeMapKeypoints.size() << endl;
-
-        cout << "Mutual matches:    "
-            << goodMatchesCount << endl;
-
-        cout << "RANSAC inliers:    "
-            << inlierCount << endl;
-
-        cout << "Inlier ratio:      "
-            << fixed << setprecision(2)
-            << inlierRatio << endl;
-
-        cout << "BINS radius:       "
+        cout << "BINS search radius: "
             << binsErrorRadius << " px"
             << endl;
 
-        cout << "Motion data:       "
-            << (simulationData.available
-                ? "AVAILABLE"
-                : "STUB / NOT AVAILABLE")
+        cout << "Map position:       ("
+            << fusedPosition.x << ", "
+            << fusedPosition.y << ") px"
             << endl;
 
-        cout << "BINS velocity N:   "
-            << binsVelocityNorth
-            << " m/s" << endl;
-
-        cout << "BINS velocity E:   "
-            << binsVelocityEast
-            << " m/s" << endl;
-
-        cout << "BINS velocity U:   "
-            << binsVelocityUp
-            << " m/s" << endl;
-
-        cout << "Flight distance:   "
-            << fixed << setprecision(1)
-            << trajectoryCalculator
-            .getDistancePixels()
-            << " px"
-            << endl;
-
-        cout << "SIFT correction:   "
+        cout << "SIFT correction:    "
             << trajectoryCalculator
             .getLastCorrectionPixels()
-            << " px"
-            << endl;
+            << " px" << endl;
 
-        if (initialPositionFound) {
-            cout << "Position:          ("
-                << cvRound(fusedPosition.x)
-                << ", "
-                << cvRound(fusedPosition.y)
-                << ")"
-                << endl;
-        }
-
-        cout << endl;
+        cout << "Map distance:       "
+            << trajectoryCalculator
+            .getDistancePixels()
+            << " px" << endl;
 
         trajectoryFile
             << frameID << "\t"
@@ -641,7 +807,20 @@ int main()
 
             << trajectoryCalculator
             .getLastCorrectionPixels()
+            << "\t"
 
+            << simulationData.phase << "\t"
+            << simulationData.trueState.x << "\t"
+            << simulationData.trueState.y << "\t"
+            << simulationData.trueState.z << "\t"
+            << simulationData.trueState.velocityX << "\t"
+            << simulationData.trueState.velocityY << "\t"
+            << simulationData.trueState.velocityZ << "\t"
+            << simulationData.binsState.x << "\t"
+            << simulationData.binsState.y << "\t"
+            << simulationData.binsState.z << "\t"
+            << simulationPositionErrorMeters << "\t"
+            << simulationHeadingErrorDegrees
             << "\n";
 
         Mat mapColor;
@@ -699,11 +878,17 @@ int main()
                 mapColor.rows,
                 frameColor.rows);
 
-        constexpr int PANEL_HEIGHT = 140;
+        constexpr int PANEL_HEIGHT = 270;
+        constexpr int MINIMUM_INTERFACE_WIDTH = 1050;
+
+        int interfaceWidth =
+            std::max(
+                mapWidth + frameWidth,
+                MINIMUM_INTERFACE_WIDTH);
 
         Mat result = Mat::zeros(
             Size(
-                mapWidth + frameWidth,
+                interfaceWidth,
                 contentHeight +
                 PANEL_HEIGHT),
             CV_8UC3);
@@ -770,6 +955,20 @@ int main()
                 LINE_AA);
         }
 
+        // Зелёная линия — эталонная траектория симулятора.
+        for (size_t index = 1;
+            index < trueSimulationTrajectory.size();
+            index++) {
+
+            line(
+                result,
+                trueSimulationTrajectory[index - 1],
+                trueSimulationTrajectory[index],
+                Scalar(0, 220, 0),
+                2,
+                LINE_AA);
+        }
+
         for (size_t index = 1;
             index < trajectory.size();
             index++) {
@@ -797,6 +996,30 @@ int main()
                 binsTrajectory[index],
                 Scalar(255, 0, 255),
                 1,
+                LINE_AA);
+        }
+
+        if (simulationMapAnchorInitialized) {
+            circle(
+                result,
+                trueSimulationMapPosition,
+                7,
+                Scalar(0, 220, 0),
+                FILLED,
+                LINE_AA);
+
+            putText(
+                result,
+                "TRUE",
+                Point(
+                    cvRound(
+                        trueSimulationMapPosition.x + 9),
+                    cvRound(
+                        trueSimulationMapPosition.y - 7)),
+                FONT_HERSHEY_SIMPLEX,
+                0.48,
+                Scalar(0, 220, 0),
+                2,
                 LINE_AA);
         }
 
@@ -858,44 +1081,175 @@ int main()
             FILLED);
 
         int textY =
-            contentHeight + 25;
+            contentHeight + 28;
 
         char text[500];
 
         sprintf_s(
             text,
             sizeof(text),
-            "Frame: %d | Mode: %s | SIFT: %s",
-            frameID,
-            mode.c_str(),
-            siftValid
+            "SIMULATION: %s | Phase: %s | Time: %.1f s | Frame: %d",
+            simulationData.available
             ? "ACTIVE"
-            : "LOST");
+            : "OFF",
+            simulationData.phase.c_str(),
+            currentTime,
+            frameID);
 
         putText(
             result,
             text,
-            Point(10, textY),
+            Point(12, textY),
             FONT_HERSHEY_SIMPLEX,
-            0.52,
-            siftValid
+            0.58,
+            simulationData.available
             ? Scalar(0, 255, 0)
-            : Scalar(0, 100, 255),
+            : Scalar(0, 0, 255),
             2,
             LINE_AA);
 
         sprintf_s(
             text,
             sizeof(text),
-            "Reason: %s",
-            failureReason.c_str());
+            "TRUE  position N/E/H: %7.2f  %7.2f  %6.2f m | heading: %6.1f deg",
+            simulationData.trueState.x,
+            simulationData.trueState.y,
+            simulationData.trueState.z,
+            simulationData.trueState.heading *
+            180.0 /
+            3.14159265358979323846);
 
         putText(
             result,
             text,
-            Point(10, textY + 28),
+            Point(12, textY + 29),
             FONT_HERSHEY_SIMPLEX,
-            0.47,
+            0.48,
+            Scalar(0, 220, 0),
+            1,
+            LINE_AA);
+
+        sprintf_s(
+            text,
+            sizeof(text),
+            "TRUE  velocity N/E/U: %6.2f  %6.2f  %6.2f m/s | ground speed: %.2f m/s",
+            simulationData.trueState.velocityX,
+            simulationData.trueState.velocityY,
+            simulationData.trueState.velocityZ,
+            trueHorizontalSpeed);
+
+        putText(
+            result,
+            text,
+            Point(12, textY + 58),
+            FONT_HERSHEY_SIMPLEX,
+            0.48,
+            Scalar(0, 220, 0),
+            1,
+            LINE_AA);
+
+        sprintf_s(
+            text,
+            sizeof(text),
+            "BINS  pos N/E/H: %7.2f  %7.2f  %6.2f m | error H/3D: %.3f/%.3f m | heading: %.2f deg",
+            simulationData.binsState.x,
+            simulationData.binsState.y,
+            simulationData.binsState.z,
+            simulationHorizontalErrorMeters,
+            simulationPositionErrorMeters,
+            simulationHeadingErrorDegrees);
+
+        putText(
+            result,
+            text,
+            Point(12, textY + 87),
+            FONT_HERSHEY_SIMPLEX,
+            0.48,
+            Scalar(255, 0, 255),
+            1,
+            LINE_AA);
+
+        sprintf_s(
+            text,
+            sizeof(text),
+            "BINS  velocity N/E/U: %6.2f  %6.2f  %6.2f m/s",
+            binsVelocityNorth,
+            binsVelocityEast,
+            binsVelocityUp);
+
+        putText(
+            result,
+            text,
+            Point(12, textY + 116),
+            FONT_HERSHEY_SIMPLEX,
+            0.48,
+            Scalar(255, 0, 255),
+            1,
+            LINE_AA);
+
+        sprintf_s(
+            text,
+            sizeof(text),
+            "SENSORS true A:[%.2f %.2f %.2f] | IMU A:[%.2f %.2f %.2f] m/s2 | gyro Z true/IMU: %.4f/%.4f",
+            simulationData.trueAcceleration.x,
+            simulationData.trueAcceleration.y,
+            simulationData.trueAcceleration.z,
+            simulationData.acceleration.x,
+            simulationData.acceleration.y,
+            simulationData.acceleration.z,
+            simulationData.trueAngularVelocity.z,
+            simulationData.angularVelocity.z);
+
+        putText(
+            result,
+            text,
+            Point(12, textY + 145),
+            FONT_HERSHEY_SIMPLEX,
+            0.46,
+            Scalar(210, 210, 210),
+            1,
+            LINE_AA);
+
+        sprintf_s(
+            text,
+            sizeof(text),
+            "SIFT: %s | matches/inliers: %d/%d | ratio: %.2f | mode: %s",
+            siftValid
+            ? "ACTIVE"
+            : "LOST",
+            goodMatchesCount,
+            inlierCount,
+            inlierRatio,
+            mode.c_str());
+
+        putText(
+            result,
+            text,
+            Point(12, textY + 174),
+            FONT_HERSHEY_SIMPLEX,
+            0.48,
+            siftValid
+            ? Scalar(0, 255, 255)
+            : Scalar(0, 100, 255),
+            1,
+            LINE_AA);
+
+        sprintf_s(
+            text,
+            sizeof(text),
+            "NAV   map position: (%.1f, %.1f) px | search radius: %.1f px | correction: %.1f px",
+            fusedPosition.x,
+            fusedPosition.y,
+            binsErrorRadius,
+            trajectoryCalculator
+            .getLastCorrectionPixels());
+
+        putText(
+            result,
+            text,
+            Point(12, textY + 203),
+            FONT_HERSHEY_SIMPLEX,
+            0.46,
             Scalar(255, 255, 255),
             1,
             LINE_AA);
@@ -903,69 +1257,38 @@ int main()
         sprintf_s(
             text,
             sizeof(text),
-            "Frame points: %zu | Map points: %zu | Matches: %d | Inliers: %d (%.2f)",
-            frameKeypoints.size(),
-            activeMapKeypoints.size(),
-            goodMatchesCount,
-            inlierCount,
-            inlierRatio);
+            "Legend: TRUE=green | BINS=magenta | FUSED=cyan | SIFT=yellow | ESC=exit | S=screenshot");
 
         putText(
             result,
             text,
-            Point(10, textY + 56),
+            Point(12, textY + 232),
             FONT_HERSHEY_SIMPLEX,
-            0.45,
-            Scalar(200, 200, 200),
+            0.44,
+            Scalar(180, 180, 180),
             1,
             LINE_AA);
 
-        sprintf_s(
-            text,
-            sizeof(text),
-            "BINS radius: %.1f px | Lost: %d | Scale: %.2f | Motion: %s",
-            binsErrorRadius,
-            lostFrames,
-            frameScale,
-            simulationData.available
-            ? "BINS+SIFT"
-            : "SIFT ONLY");
-
-        putText(
-            result,
-            text,
-            Point(10, textY + 84),
-            FONT_HERSHEY_SIMPLEX,
-            0.45,
-            Scalar(200, 200, 255),
-            1,
-            LINE_AA);
-
-        if (initialPositionFound) {
+        if (!siftValid) {
             sprintf_s(
                 text,
                 sizeof(text),
-                "Position: (%.1f, %.1f) px | Distance: %.1f px | Correction: %.1f px",
-                fusedPosition.x,
-                fusedPosition.y,
-                trajectoryCalculator
-                .getDistancePixels(),
-                trajectoryCalculator
-                .getLastCorrectionPixels());
+                "SIFT reason: %s",
+                failureReason.c_str());
 
             putText(
                 result,
                 text,
-                Point(10, textY + 112),
+                Point(550, textY + 174),
                 FONT_HERSHEY_SIMPLEX,
-                0.47,
-                Scalar(0, 255, 255),
+                0.43,
+                Scalar(0, 130, 255),
                 1,
                 LINE_AA);
         }
 
         imshow(
-            "Drone Navigation - Reliable BINS + SIFT",
+            "Drone Navigation - Simulation + BINS + SIFT",
             result);
 
         int key =
@@ -1013,18 +1336,60 @@ int main()
         << successPercent << "%"
         << endl;
 
-    cout << "Flight distance: "
+    cout << "Map distance:    "
         << fixed << setprecision(1)
         << trajectoryCalculator
         .getDistancePixels()
         << " px"
         << endl;
 
-    cout << "Motion data:     "
-        << (trajectoryCalculator.hasMotionData()
-            ? "AVAILABLE"
-            : "NOT AVAILABLE / SIFT ONLY")
+    cout << "Simulation:      "
+        << (lastSimulationData.available
+            ? "ACTIVE"
+            : "OFF")
         << endl;
+
+    if (lastSimulationData.available) {
+        const double finalErrorX =
+            lastSimulationData.binsState.x -
+            lastSimulationData.trueState.x;
+
+        const double finalErrorY =
+            lastSimulationData.binsState.y -
+            lastSimulationData.trueState.y;
+
+        const double finalErrorZ =
+            lastSimulationData.binsState.z -
+            lastSimulationData.trueState.z;
+
+        const double finalSimulationError =
+            std::sqrt(
+                finalErrorX * finalErrorX +
+                finalErrorY * finalErrorY +
+                finalErrorZ * finalErrorZ);
+
+        cout << "Final phase:     "
+            << lastSimulationData.phase << endl;
+
+        cout << "True position:   ("
+            << lastSimulationData.trueState.x << ", "
+            << lastSimulationData.trueState.y << ", "
+            << lastSimulationData.trueState.z << ") m"
+            << endl;
+
+        cout << "BINS position:   ("
+            << lastSimulationData.binsState.x << ", "
+            << lastSimulationData.binsState.y << ", "
+            << lastSimulationData.binsState.z << ") m"
+            << endl;
+
+        cout << "BINS 3D error:   "
+            << finalSimulationError << " m"
+            << endl;
+    }
+
+    cout << "Detailed log:    "
+        << TRAJECTORY_PATH << endl;
 
     cout << "========================================" << endl;
 

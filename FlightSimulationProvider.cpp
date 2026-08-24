@@ -4,23 +4,55 @@ FlightSimulationData getFlightSimulationData(
     double time,
     double dt)
 {
-    (void)time;
-    (void)dt;
+    static FlightSimulation simulation;
+    static double previousTime = -1.0;
+
+    if (previousTime >= 0.0 &&
+        time < previousTime) {
+        simulation.reset();
+    }
+
+    const FlightSimulationOutput simulationOutput =
+        simulation.update(dt);
+
+    previousTime = time;
 
     FlightSimulationData data;
 
-    // Пока симулятор не подключён, данные не участвуют
-    // в прогнозировании траектории.
-    data.available = false;
-
+    data.available = true;
     data.acceleration =
-        Vector3d(0.0, 0.0, 9.81);
+        simulationOutput.measuredAcceleration;
 
     data.angularVelocity =
-        Vector3d(0.0, 0.0, 0.0);
+        simulationOutput.measuredAngularVelocity;
 
-    data.altitude = 0.0;
-    data.verticalVelocity = 0.0;
+    data.trueAcceleration =
+        Vector3d(
+            simulationOutput.trueAccelerationBodyX,
+            simulationOutput.trueAccelerationBodyY,
+            9.81 +
+            simulationOutput.trueAccelerationZ);
+
+    data.trueAngularVelocity =
+        Vector3d(
+            0.0,
+            0.0,
+            simulationOutput.trueAngularVelocity);
+
+    data.altitude =
+        simulationOutput.trueState.z;
+
+    data.verticalVelocity =
+        simulationOutput.trueState.velocityZ;
+
+    data.trueState =
+        simulationOutput.trueState;
+
+    data.binsState =
+        simulationOutput.binsState;
+
+    data.phase =
+        simulationOutput.phase;
 
     return data;
 }
